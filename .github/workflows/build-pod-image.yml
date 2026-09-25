@@ -75,7 +75,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
           context: pod
-          file: Dockerfile
+          file: pod/Dockerfile
           platforms: linux/amd64
           push: true
           secrets: |
