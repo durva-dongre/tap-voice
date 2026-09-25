@@ -1,0 +1,42 @@
+name = "tap-voice"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tts-jobs"
+database_id = "54a5b872-1113-4e36-8c16-413e7309a7ac"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[observability]
+enabled = true
+
+
+[vars]
+TZ_OFFSET_MIN = "330"
+SLOTS = "12:00,15:00,18:00,21:00"
+SLOT_WINDOW_MIN = "30"
+MAINT_LOCAL_TIME = "03:00"
+MAX_JOBS_PER_CLAIM = "400"
+MAX_RUN_SECONDS = "2700"
+BEAT_TIMEOUT_SECONDS = "300"
+BOOT_GRACE_SECONDS = "900"
+MAX_ATTEMPTS = "3"
+MAX_TEXT_CHARS = "1000"
+MIN_PENDING_TO_START = "1"
+DAILY_RUN_MINUTES_CAP = "200"
+ENFORCE_WA_WINDOW = "0"
+WA_DRY_RUN = "0"
+WA_API_VERSION = "v21.0"
+RETENTION_DAYS = "30"
+TEXT_RETENTION_DAYS = "7"
+POD_IMAGE = "SET_BY_DEPLOY"
+POD_GPU_IDS = "NVIDIA GeForce RTX 3070"
+POD_CLOUD = "COMMUNITY"
+POD_DISK_GB = "20"
+RUNPOD_API_BASE = "https://api.runpod.io/v2"
+RUNPOD_REGISTRY_AUTH_ID = ""
+WORKER_PUBLIC_URL = "https://tap-voice.tap-voice.workers.dev"
+ALERT_WEBHOOK_URL = ""

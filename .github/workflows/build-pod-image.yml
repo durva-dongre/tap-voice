@@ -1,0 +1,103 @@
+name: build-pod-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag (blank = git short SHA)
+        required: false
+        type: string
+      indic_dtype:
+        description: INDIC_DTYPE baked into the image
+        required: true
+        type: choice
+        default: float16
+        options:
+          - float16
+          - float32
+      kokoro_rev:
+        description: KOKORO_REV build-arg (blank = latest)
+        required: false
+        type: string
+      indic_rev:
+        description: INDIC_REV build-arg (blank = latest)
+        required: false
+        type: string
+      push_buildcache:
+        description: Push updated registry buildcache layer
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-pod-image
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag and repo
+        id: tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "resolved_tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "resolved_tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+          echo "repo=${{ secrets.DOCKERHUB_USERNAME }}/tts-pod" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        with:
+          context: pod
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          secrets: |
+            id=hf,env=HF_TOKEN
+          build-args: |
+            KOKORO_REV=${{ inputs.kokoro_rev }}
+            INDIC_REV=${{ inputs.indic_rev }}
+            INDIC_DTYPE=${{ inputs.indic_dtype }}
+          tags: ${{ steps.tag.outputs.repo }}:${{ steps.tag.outputs.resolved_tag }}
+          cache-from: type=registry,ref=${{ steps.tag.outputs.repo }}:buildcache
+          cache-to: ${{ inputs.push_buildcache == 'true' && format('type=registry,ref={0}:buildcache,mode=max', steps.tag.outputs.repo) || '' }}
+
+      - name: Write build summary
+        run: |
+          {
+            echo "### Pod image build"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Resolved tag | \`${{ steps.tag.outputs.resolved_tag }}\` |"
+            echo "| INDIC_DTYPE | \`${{ inputs.indic_dtype }}\` |"
+            echo "| KOKORO_REV | \`${{ inputs.kokoro_rev }}\` |"
+            echo "| INDIC_REV | \`${{ inputs.indic_rev }}\` |"
+            echo "| Pull reference | \`${{ steps.tag.outputs.repo }}:${{ steps.tag.outputs.resolved_tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

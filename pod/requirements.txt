@@ -1,0 +1,9 @@
+kokoro>=0.9.4
+misaki[en]
+soundfile
+numpy
+requests
+sentencepiece
+transformers
+huggingface_hub
+git+https://github.com/huggingface/parler-tts.git@d108732cd57788ec86bc857d99a6cabd66663d68
