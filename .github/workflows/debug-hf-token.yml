@@ -1,0 +1,50 @@
+name: debug-hf-token
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  check-secret:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check secret exists at GitHub Actions level
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "RESULT: HF_TOKEN secret is EMPTY or NOT SET at the GitHub Actions level."
+            exit 1
+          fi
+          echo "RESULT: HF_TOKEN is present."
+          echo "Length: ${#HF_TOKEN}"
+          echo "First 6 chars: ${HF_TOKEN:0:6}"
+          echo "Last 4 chars: ${HF_TOKEN: -4}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Write throwaway Dockerfile
+        run: |
+          cat > Dockerfile.debug << 'EOF'
+          FROM alpine:3.20
+          RUN --mount=type=secret,id=hf sh -c '\
+            if [ -s /run/secrets/hf ]; then \
+              echo "BUILD SECRET RESULT: present, length $(wc -c < /run/secrets/hf)"; \
+            else \
+              echo "BUILD SECRET RESULT: EMPTY or MISSING inside build"; \
+            fi'
+          EOF
+
+      - name: Build with secret mount (no push)
+        uses: docker/build-push-action@v5
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        with:
+          context: .
+          file: Dockerfile.debug
+          push: false
+          secrets: |
+            id=hf,env=HF_TOKEN
