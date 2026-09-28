@@ -1,9 +1,9 @@
-kokoro>=0.9.4
-misaki[en]
+transformers==4.46.3
+huggingface_hub==0.26.5
+snac==1.2.1
+numpy<2
 soundfile
-numpy
+soxr
 requests
-sentencepiece
-transformers
-huggingface_hub
-git+https://github.com/huggingface/parler-tts.git@d108732cd57788ec86bc857d99a6cabd66663d68
+google-cloud-storage
+pytest 

@@ -1,4 +1,7 @@
 #!/bin/sh
+if [ "${DEBUG_SLEEP:-0}" = "1" ]; then
+    exec sleep infinity
+fi
 if [ "${SELFTEST:-0}" = "1" ]; then
     python -m app.selftest
     exit $?

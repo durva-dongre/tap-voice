@@ -1,40 +1,92 @@
+import hashlib
+import json
 import os
+import shutil
 import sys
-from huggingface_hub import snapshot_download
 
-def clean_token(raw):
-    if raw is None:
-        return None
-    t = raw.strip()
-    return t or None
+SMALL = ["*.json", "tokenizer*", "special_tokens_map.json", "*.model", "*.txt"]
 
-token = clean_token(os.environ.get("HF_TOKEN"))
-kokoro_rev = os.environ.get("KOKORO_REV") or None
-indic_rev = os.environ.get("INDIC_REV") or None
 
-print(f"HF_TOKEN present: {token is not None}", flush=True)
-if token:
-    print(f"HF_TOKEN length: {len(token)} prefix: {token[:6]}... suffix: ...{token[-4:]}", flush=True)
-else:
-    print("WARNING: HF_TOKEN is empty or missing after cleaning", flush=True)
+def env(name, default=""):
+    return os.environ.get(name, "").strip() or default
 
-print("Fetching Kokoro weights...", flush=True)
-snapshot_download(
-    repo_id="hexgrad/Kokoro-82M",
-    revision=kokoro_rev,
-    token=token,
-)
 
-print("Fetching Indic Parler-TTS weights...", flush=True)
-try:
+def redact(text):
+    token = env("HF_TOKEN")
+    text = str(text)
+    return text.replace(token, "***") if token else text
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def describe(directory):
+    files = {}
+    for base, _, names in os.walk(directory):
+        for name in names:
+            path = os.path.join(base, name)
+            if os.path.islink(path):
+                raise RuntimeError(f"symlink not allowed: {path}")
+            rel = os.path.relpath(path, directory)
+            files[rel] = {"sha256": sha256_file(path), "bytes": os.path.getsize(path)}
+    return dict(sorted(files.items()))
+
+
+def fetch(repo, revision, dest, patterns):
+    from huggingface_hub import HfApi, snapshot_download
+
+    token = env("HF_TOKEN") or None
+    sha = HfApi(token=token).model_info(repo, revision=revision).sha
+    if not sha:
+        raise RuntimeError(f"could not resolve {repo}@{revision}")
+    shutil.rmtree(dest, ignore_errors=True)
     snapshot_download(
-        repo_id="ai4bharat/indic-parler-tts",
-        revision=indic_rev,
-        token=token,
+        repo_id=repo, revision=sha, local_dir=dest, allow_patterns=patterns, token=token
     )
-except Exception as e:
-    print(f"FAILED to fetch ai4bharat/indic-parler-tts: {e}", file=sys.stderr, flush=True)
-    print(f"token was present: {token is not None}, length: {len(token) if token else 0}", file=sys.stderr, flush=True)
-    raise
+    shutil.rmtree(os.path.join(dest, ".cache"), ignore_errors=True)
+    if not os.path.isfile(os.path.join(dest, "config.json")):
+        raise RuntimeError(f"config.json missing after downloading {repo}")
+    return {"repo": repo, "revision": sha, "files": describe(dest)}
 
-print("All weights fetched successfully.", flush=True)
+
+def main():
+    models_dir = env("MODELS_DIR", "/opt/models")
+    raw_dir = env("RAW_DIR", "/opt/raw")
+    svara_repo = env("SVARA_REPO", "kenpath/svara-tts-v1")
+    snac_repo = env("SNAC_REPO", "hubertsiuzdak/snac_24khz")
+    svara_patterns = list(SMALL)
+    if not env("PREQUANTIZED_REPO"):
+        svara_patterns.append("*.safetensors")
+    try:
+        os.makedirs(models_dir, exist_ok=True)
+        os.makedirs(raw_dir, exist_ok=True)
+        svara = fetch(
+            svara_repo,
+            env("SVARA_REVISION", "main"),
+            os.path.join(raw_dir, "svara-bf16"),
+            svara_patterns,
+        )
+        snac = fetch(
+            snac_repo,
+            env("SNAC_REVISION", "main"),
+            os.path.join(models_dir, "snac_24khz"),
+            ["config.json", "pytorch_model.bin"],
+        )
+        with open(os.path.join(models_dir, "weights_manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump({"svara": svara, "snac": snac}, handle, indent=2, sort_keys=True)
+    except Exception as exc:
+        sys.stderr.write(f"fetch_weights failed: {type(exc).__name__}: {redact(exc)}\n")
+        return 1
+    sys.stdout.write(
+        f"fetch_weights ok: svara={svara['revision'][:12]} snac={snac['revision'][:12]}\n"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

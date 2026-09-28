@@ -1,0 +1,4 @@
+pytest
+numpy<2
+soundfile
+soxr

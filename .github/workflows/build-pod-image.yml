@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: ""
+      prequantized_revision:
+        description: FP8 repo revision (blank = pinned default)
+        required: false
+        type: string
+        default: ""
       push_buildcache:
         description: Push updated registry buildcache
         required: true
@@ -37,7 +42,6 @@ on:
       - pod/requirements-build.txt
       - pod/build/**
       - pod/app/**
-      - pod/entrypoint.sh
       - .github/workflows/build-pod-image.yml
 
 concurrency:
@@ -51,6 +55,8 @@ env:
   DEFAULT_SVARA_REVISION: ${{ vars.DEFAULT_SVARA_REVISION }}
   DEFAULT_SNAC_REVISION: ${{ vars.DEFAULT_SNAC_REVISION }}
   DEFAULT_VLLM_VERSION: ${{ vars.DEFAULT_VLLM_VERSION }}
+  DEFAULT_PREQUANTIZED_REVISION: ${{ vars.PREQUANTIZED_REVISION }}
+  PREQUANTIZED_REPO: ${{ vars.PREQUANTIZED_REPO }}
   IMAGE_REPO_NAME: ${{ vars.IMAGE_REPO_NAME }}
 
 jobs:
@@ -107,6 +113,7 @@ jobs:
           IN_SVARA: ${{ inputs.svara_revision }}
           IN_SNAC: ${{ inputs.snac_revision }}
           IN_VLLM: ${{ inputs.vllm_version }}
+          IN_PREQ_REV: ${{ inputs.prequantized_revision }}
           IN_CACHE: ${{ inputs.push_buildcache }}
           EVENT: ${{ github.event_name }}
           DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -117,6 +124,7 @@ jobs:
           svara="${IN_SVARA:-${DEFAULT_SVARA_REVISION:-main}}"
           snac="${IN_SNAC:-${DEFAULT_SNAC_REVISION:-main}}"
           vllm="${IN_VLLM:-${DEFAULT_VLLM_VERSION:-}}"
+          preq_rev="${IN_PREQ_REV:-${DEFAULT_PREQUANTIZED_REVISION:-main}}"
           repo_name="${IMAGE_REPO_NAME:-svara-tts-pod}"
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$IN_CACHE" = "false" ]; then
             push_cache="false"
@@ -127,6 +135,10 @@ jobs:
             echo "DEFAULT_VLLM_VERSION repo variable or vllm_version input is required" >&2
             exit 1
           fi
+          if [ -z "${PREQUANTIZED_REPO:-}" ]; then
+            echo "PREQUANTIZED_REPO repo variable is required because runners have no GPU" >&2
+            exit 1
+          fi
           case "$tag" in
             *[!A-Za-z0-9._-]*) echo "invalid tag" >&2; exit 1 ;;
           esac
@@ -135,6 +147,7 @@ jobs:
             echo "svara_revision=$svara"
             echo "snac_revision=$snac"
             echo "vllm_version=$vllm"
+            echo "preq_revision=$preq_rev"
             echo "push_cache=$push_cache"
             echo "image_repo=${DOCKERHUB_USER}/${repo_name}"
           } >> "$GITHUB_OUTPUT"
@@ -163,9 +176,10 @@ jobs:
             SVARA_REVISION=${{ steps.resolve.outputs.svara_revision }}
             SNAC_REVISION=${{ steps.resolve.outputs.snac_revision }}
             VLLM_VERSION=${{ steps.resolve.outputs.vllm_version }}
+            PREQUANTIZED_REPO=${{ env.PREQUANTIZED_REPO }}
+            PREQUANTIZED_REVISION=${{ steps.resolve.outputs.preq_revision }}
           tags: |
             ${{ steps.resolve.outputs.image_repo }}:${{ steps.resolve.outputs.immutable_tag }}
-            ${{ steps.resolve.outputs.image_repo }}:stable
           cache-from: type=registry,ref=${{ steps.resolve.outputs.image_repo }}:buildcache
           cache-to: ${{ steps.resolve.outputs.push_cache == 'true' && format('type=registry,ref={0}:buildcache,mode=max', steps.resolve.outputs.image_repo) || '' }}
 
@@ -175,7 +189,7 @@ jobs:
           REF: ${{ steps.resolve.outputs.image_repo }}:${{ steps.resolve.outputs.immutable_tag }}
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect "$REF" --format '{{json .Manifest}}' > manifest.json
+          docker buildx imagetools inspect "$REF" --raw > manifest.json
           bytes="$(jq '[.layers[]?.size] | add // 0' manifest.json 2>/dev/null || echo 0)"
           echo "bytes=$bytes" >> "$GITHUB_OUTPUT"
 
@@ -186,6 +200,7 @@ jobs:
           SVARA: ${{ steps.resolve.outputs.svara_revision }}
           SNAC: ${{ steps.resolve.outputs.snac_revision }}
           VLLM: ${{ steps.resolve.outputs.vllm_version }}
+          PREQ_REV: ${{ steps.resolve.outputs.preq_revision }}
           DIGEST: ${{ steps.build.outputs.digest }}
           BYTES: ${{ steps.size.outputs.bytes }}
           PUSH_CACHE: ${{ steps.resolve.outputs.push_cache }}
@@ -197,11 +212,11 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Pull reference | \`${REPO}:${TAG}\` |"
-            echo "| Stable reference | \`${REPO}:stable\` |"
             echo "| Digest | \`${DIGEST}\` |"
             echo "| Compressed size | ${size_gb} GB |"
             echo "| Svara revision | \`${SVARA}\` |"
             echo "| SNAC revision | \`${SNAC}\` |"
+            echo "| FP8 repo | \`${PREQUANTIZED_REPO}@${PREQ_REV}\` |"
             echo "| vLLM version | \`${VLLM}\` |"
             echo "| Quantization | FP8 weights, BF16 embeddings and lm_head |"
             echo "| Buildcache pushed | ${PUSH_CACHE} |"
@@ -257,4 +272,28 @@ jobs:
             echo "| Image | \`${REF}\` |"
             echo "| Severity gate | CRITICAL (fixed only) |"
             echo "| Result | ${RESULT} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    needs: [build-and-push, scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Move stable tag
+        env:
+          REPO: ${{ needs.build-and-push.outputs.image_repo }}
+          TAG: ${{ needs.build-and-push.outputs.immutable_tag }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "${REPO}:stable" "${REPO}:${TAG}"
+          {
+            echo "### Promoted"
+            echo ""
+            echo "\`${REPO}:stable\` now points to \`${REPO}:${TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"
