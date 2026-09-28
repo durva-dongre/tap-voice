@@ -42,6 +42,7 @@ on:
       - pod/requirements-build.txt
       - pod/build/**
       - pod/app/**
+      - pod/tests/**
       - .github/workflows/build-pod-image.yml
 
 concurrency:
@@ -58,6 +59,8 @@ env:
   DEFAULT_PREQUANTIZED_REVISION: ${{ vars.PREQUANTIZED_REVISION }}
   PREQUANTIZED_REPO: ${{ vars.PREQUANTIZED_REPO }}
   IMAGE_REPO_NAME: ${{ vars.IMAGE_REPO_NAME }}
+  DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+  FALLBACK_VLLM_VERSION: 0.6.3.post1
 
 jobs:
   tests:
@@ -66,6 +69,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Check required files
+        run: |
+          set -euo pipefail
+          for f in pod/Dockerfile pod/requirements.txt pod/requirements-build.txt \
+                   pod/build/fetch_weights.py pod/build/quantize_fp8.py pod/build/verify_image.py \
+                   pod/app/entrypoint.sh; do
+            if [ ! -f "$f" ]; then
+              echo "missing file: $f" >&2
+              exit 1
+            fi
+          done
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -98,10 +113,10 @@ jobs:
           android: true
           dotnet: true
           haskell: true
-          large-packages: false
-          docker-images: false
-          swap-storage: false
-          tool-cache: false
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+          tool-cache: true
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -116,14 +131,13 @@ jobs:
           IN_PREQ_REV: ${{ inputs.prequantized_revision }}
           IN_CACHE: ${{ inputs.push_buildcache }}
           EVENT: ${{ github.event_name }}
-          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           set -euo pipefail
           short_sha="$(git rev-parse --short=12 HEAD)"
           tag="${IN_TAG:-$short_sha}"
           svara="${IN_SVARA:-${DEFAULT_SVARA_REVISION:-main}}"
           snac="${IN_SNAC:-${DEFAULT_SNAC_REVISION:-main}}"
-          vllm="${IN_VLLM:-${DEFAULT_VLLM_VERSION:-}}"
+          vllm="${IN_VLLM:-${DEFAULT_VLLM_VERSION:-$FALLBACK_VLLM_VERSION}}"
           preq_rev="${IN_PREQ_REV:-${DEFAULT_PREQUANTIZED_REVISION:-main}}"
           repo_name="${IMAGE_REPO_NAME:-svara-tts-pod}"
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$IN_CACHE" = "false" ]; then
@@ -131,8 +145,8 @@ jobs:
           else
             push_cache="true"
           fi
-          if [ -z "$vllm" ]; then
-            echo "DEFAULT_VLLM_VERSION repo variable or vllm_version input is required" >&2
+          if [ -z "${DOCKERHUB_NAMESPACE:-}" ]; then
+            echo "DOCKERHUB_NAMESPACE repo variable is required" >&2
             exit 1
           fi
           if [ -z "${PREQUANTIZED_REPO:-}" ]; then
@@ -149,7 +163,7 @@ jobs:
             echo "vllm_version=$vllm"
             echo "preq_revision=$preq_rev"
             echo "push_cache=$push_cache"
-            echo "image_repo=${DOCKERHUB_USER}/${repo_name}"
+            echo "image_repo=${DOCKERHUB_NAMESPACE}/${repo_name}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -185,6 +199,7 @@ jobs:
 
       - name: Measure pushed image size
         id: size
+        continue-on-error: true
         env:
           REF: ${{ steps.resolve.outputs.image_repo }}:${{ steps.resolve.outputs.immutable_tag }}
         run: |
@@ -194,6 +209,7 @@ jobs:
           echo "bytes=$bytes" >> "$GITHUB_OUTPUT"
 
       - name: Write build summary
+        if: always()
         env:
           REPO: ${{ steps.resolve.outputs.image_repo }}
           TAG: ${{ steps.resolve.outputs.immutable_tag }}
@@ -205,7 +221,7 @@ jobs:
           BYTES: ${{ steps.size.outputs.bytes }}
           PUSH_CACHE: ${{ steps.resolve.outputs.push_cache }}
         run: |
-          size_gb="$(awk -v b="$BYTES" 'BEGIN { printf "%.2f", b / 1073741824 }')"
+          size_gb="$(awk -v b="${BYTES:-0}" 'BEGIN { printf "%.2f", b / 1073741824 }')"
           {
             echo "### Pod image build"
             echo ""
@@ -233,10 +249,10 @@ jobs:
           android: true
           dotnet: true
           haskell: true
-          large-packages: false
-          docker-images: false
-          swap-storage: false
-          tool-cache: false
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+          tool-cache: true
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3

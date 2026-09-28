@@ -1,9 +1,5 @@
-transformers==4.46.3
-huggingface_hub==0.26.5
-snac==1.2.1
+pytest
 numpy<2
 soundfile
 soxr
 requests
-google-cloud-storage
-pytest 

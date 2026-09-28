@@ -5,9 +5,11 @@ from .prompt import AUDIO_END, AUDIO_OFFSET, EOS
 FRAME = 7
 BAND = 4096
 
+_PROCESSOR_CACHE = {}
+
 
 class RangeMask:
-    def __init__(self, vocab_size):
+    def __init__(self, vocab_size=None):
         import torch
 
         self.torch = torch
@@ -15,7 +17,7 @@ class RangeMask:
         self.mask = None
 
     def _get(self, logits):
-        if self.mask is None or self.mask.device != logits.device:
+        if self.mask is None or self.mask.device != logits.device or self.mask.dtype != logits.dtype:
             mask = self.torch.full(
                 (logits.shape[-1],), float("-inf"), device=logits.device, dtype=logits.dtype
             )
@@ -29,7 +31,7 @@ class RangeMask:
 
 
 class FrameMask:
-    def __init__(self, vocab_size):
+    def __init__(self, vocab_size=None):
         import torch
 
         self.torch = torch
@@ -37,7 +39,11 @@ class FrameMask:
         self.masks = None
 
     def _get(self, logits):
-        if self.masks is None or self.masks[0].device != logits.device:
+        if (
+            self.masks is None
+            or self.masks[0].device != logits.device
+            or self.masks[0].dtype != logits.dtype
+        ):
             masks = []
             for slot in range(FRAME):
                 mask = self.torch.full(
@@ -64,9 +70,19 @@ def allowed_token_ids():
     return ids
 
 
-def build_processors(kind, vocab_size):
+def build_processors(kind, vocab_size=None):
     if kind == "frame":
         return [FrameMask(vocab_size)]
     if kind == "range":
         return [RangeMask(vocab_size)]
     return []
+
+
+def sampling_restrictions(kind, vocab_size=None):
+    if kind == "allowed":
+        return {"allowed_token_ids": allowed_token_ids()}
+    if kind in ("range", "frame"):
+        if kind not in _PROCESSOR_CACHE:
+            _PROCESSOR_CACHE[kind] = build_processors(kind, vocab_size)
+        return {"logits_processors": _PROCESSOR_CACHE[kind]}
+    return {}
