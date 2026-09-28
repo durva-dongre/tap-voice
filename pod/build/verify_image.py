@@ -3,6 +3,10 @@ import importlib.util
 import os
 import sys
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 for name in ("GCS_BUCKET", "GCS_SERVICE_ACCOUNT_JSON_B64", "CDN_BASE_URL", "MODEL_REVISION"):
     if not os.environ.get(name, "").strip():
         os.environ[name] = "verify"
