@@ -4,41 +4,90 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: Image tag (blank = git short SHA)
+        description: Image tag (blank = short SHA)
         required: false
         type: string
-      indic_dtype:
-        description: INDIC_DTYPE baked into the image
-        required: true
-        type: choice
-        default: float16
-        options:
-          - float16
-          - float32
-      kokoro_rev:
-        description: KOKORO_REV build-arg (blank = latest)
+        default: ""
+      svara_revision:
+        description: Svara commit hash (blank = pinned default)
         required: false
         type: string
-      indic_rev:
-        description: INDIC_REV build-arg (blank = latest)
+        default: ""
+      snac_revision:
+        description: SNAC commit hash (blank = pinned default)
         required: false
         type: string
+        default: ""
+      vllm_version:
+        description: vLLM version (blank = pinned default)
+        required: false
+        type: string
+        default: ""
       push_buildcache:
-        description: Push updated registry buildcache layer
+        description: Push updated registry buildcache
         required: true
         type: boolean
         default: true
+  push:
+    branches:
+      - main
+    paths:
+      - pod/Dockerfile
+      - pod/requirements.txt
+      - pod/requirements-build.txt
+      - pod/build/**
+      - pod/app/**
+      - pod/entrypoint.sh
+      - .github/workflows/build-pod-image.yml
 
 concurrency:
-  group: build-pod-image
+  group: build-pod-image-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
+env:
+  DEFAULT_SVARA_REVISION: ${{ vars.DEFAULT_SVARA_REVISION }}
+  DEFAULT_SNAC_REVISION: ${{ vars.DEFAULT_SNAC_REVISION }}
+  DEFAULT_VLLM_VERSION: ${{ vars.DEFAULT_VLLM_VERSION }}
+  IMAGE_REPO_NAME: ${{ vars.IMAGE_REPO_NAME }}
+
 jobs:
-  build-and-push:
+  tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pod/tests/requirements-test.txt
+
+      - name: Install test dependencies
+        run: pip install --no-cache-dir -r pod/tests/requirements-test.txt
+
+      - name: Run unit tests
+        working-directory: pod
+        env:
+          PYTHONPATH: .
+        run: python -m pytest tests -q -x
+
+  build-and-push:
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      immutable_tag: ${{ steps.resolve.outputs.immutable_tag }}
+      image_repo: ${{ steps.resolve.outputs.image_repo }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@v1.3.1
         with:
           android: true
           dotnet: true
@@ -46,19 +95,49 @@ jobs:
           large-packages: false
           docker-images: false
           swap-storage: false
+          tool-cache: false
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Resolve image tag and repo
-        id: tag
+      - name: Resolve build parameters
+        id: resolve
+        env:
+          IN_TAG: ${{ inputs.image_tag }}
+          IN_SVARA: ${{ inputs.svara_revision }}
+          IN_SNAC: ${{ inputs.snac_revision }}
+          IN_VLLM: ${{ inputs.vllm_version }}
+          IN_CACHE: ${{ inputs.push_buildcache }}
+          EVENT: ${{ github.event_name }}
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          if [ -n "${{ inputs.image_tag }}" ]; then
-            echo "resolved_tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          tag="${IN_TAG:-$short_sha}"
+          svara="${IN_SVARA:-${DEFAULT_SVARA_REVISION:-main}}"
+          snac="${IN_SNAC:-${DEFAULT_SNAC_REVISION:-main}}"
+          vllm="${IN_VLLM:-${DEFAULT_VLLM_VERSION:-}}"
+          repo_name="${IMAGE_REPO_NAME:-svara-tts-pod}"
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$IN_CACHE" = "false" ]; then
+            push_cache="false"
           else
-            echo "resolved_tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+            push_cache="true"
           fi
-          echo "repo=${{ secrets.DOCKERHUB_USERNAME }}/tts-pod" >> "$GITHUB_OUTPUT"
+          if [ -z "$vllm" ]; then
+            echo "DEFAULT_VLLM_VERSION repo variable or vllm_version input is required" >&2
+            exit 1
+          fi
+          case "$tag" in
+            *[!A-Za-z0-9._-]*) echo "invalid tag" >&2; exit 1 ;;
+          esac
+          {
+            echo "immutable_tag=$tag"
+            echo "svara_revision=$svara"
+            echo "snac_revision=$snac"
+            echo "vllm_version=$vllm"
+            echo "push_cache=$push_cache"
+            echo "image_repo=${DOCKERHUB_USER}/${repo_name}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -70,32 +149,112 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: pod
           file: pod/Dockerfile
           platforms: linux/amd64
           push: true
+          provenance: false
           secrets: |
             hf=${{ secrets.HF_TOKEN }}
           build-args: |
-            KOKORO_REV=${{ inputs.kokoro_rev }}
-            INDIC_REV=${{ inputs.indic_rev }}
-            INDIC_DTYPE=${{ inputs.indic_dtype }}
-          tags: ${{ steps.tag.outputs.repo }}:${{ steps.tag.outputs.resolved_tag }}
-          cache-from: type=registry,ref=${{ steps.tag.outputs.repo }}:buildcache
-          cache-to: ${{ inputs.push_buildcache == 'true' && format('type=registry,ref={0}:buildcache,mode=max', steps.tag.outputs.repo) || '' }}
+            SVARA_REVISION=${{ steps.resolve.outputs.svara_revision }}
+            SNAC_REVISION=${{ steps.resolve.outputs.snac_revision }}
+            VLLM_VERSION=${{ steps.resolve.outputs.vllm_version }}
+          tags: |
+            ${{ steps.resolve.outputs.image_repo }}:${{ steps.resolve.outputs.immutable_tag }}
+            ${{ steps.resolve.outputs.image_repo }}:stable
+          cache-from: type=registry,ref=${{ steps.resolve.outputs.image_repo }}:buildcache
+          cache-to: ${{ steps.resolve.outputs.push_cache == 'true' && format('type=registry,ref={0}:buildcache,mode=max', steps.resolve.outputs.image_repo) || '' }}
+
+      - name: Measure pushed image size
+        id: size
+        env:
+          REF: ${{ steps.resolve.outputs.image_repo }}:${{ steps.resolve.outputs.immutable_tag }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$REF" --format '{{json .Manifest}}' > manifest.json
+          bytes="$(jq '[.layers[]?.size] | add // 0' manifest.json 2>/dev/null || echo 0)"
+          echo "bytes=$bytes" >> "$GITHUB_OUTPUT"
 
       - name: Write build summary
+        env:
+          REPO: ${{ steps.resolve.outputs.image_repo }}
+          TAG: ${{ steps.resolve.outputs.immutable_tag }}
+          SVARA: ${{ steps.resolve.outputs.svara_revision }}
+          SNAC: ${{ steps.resolve.outputs.snac_revision }}
+          VLLM: ${{ steps.resolve.outputs.vllm_version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          BYTES: ${{ steps.size.outputs.bytes }}
+          PUSH_CACHE: ${{ steps.resolve.outputs.push_cache }}
         run: |
+          size_gb="$(awk -v b="$BYTES" 'BEGIN { printf "%.2f", b / 1073741824 }')"
           {
             echo "### Pod image build"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Resolved tag | \`${{ steps.tag.outputs.resolved_tag }}\` |"
-            echo "| INDIC_DTYPE | \`${{ inputs.indic_dtype }}\` |"
-            echo "| KOKORO_REV | \`${{ inputs.kokoro_rev }}\` |"
-            echo "| INDIC_REV | \`${{ inputs.indic_rev }}\` |"
-            echo "| Pull reference | \`${{ steps.tag.outputs.repo }}:${{ steps.tag.outputs.resolved_tag }}\` |"
+            echo "| Pull reference | \`${REPO}:${TAG}\` |"
+            echo "| Stable reference | \`${REPO}:stable\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo "| Compressed size | ${size_gb} GB |"
+            echo "| Svara revision | \`${SVARA}\` |"
+            echo "| SNAC revision | \`${SNAC}\` |"
+            echo "| vLLM version | \`${VLLM}\` |"
+            echo "| Quantization | FP8 weights, BF16 embeddings and lm_head |"
+            echo "| Buildcache pushed | ${PUSH_CACHE} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  scan:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+          tool-cache: false
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ needs.build-and-push.outputs.image_repo }}:${{ needs.build-and-push.outputs.immutable_tag }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          vuln-type: os,library
+          scanners: vuln
+        env:
+          TRIVY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          TRIVY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Write scan summary
+        if: always()
+        env:
+          REF: ${{ needs.build-and-push.outputs.image_repo }}:${{ needs.build-and-push.outputs.immutable_tag }}
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            echo "### Image scan"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Image | \`${REF}\` |"
+            echo "| Severity gate | CRITICAL (fixed only) |"
+            echo "| Result | ${RESULT} |"
           } >> "$GITHUB_STEP_SUMMARY"
