@@ -32,6 +32,10 @@ RUN apt-get update \
     && /usr/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libopus \
     && useradd -u 10001 -m runner \
     && mkdir -p /opt/hf && chown 10001:10001 /opt/hf
+RUN ln -sf /usr/bin/ffmpeg /opt/conda/bin/ffmpeg \
+    && ln -sf /usr/bin/ffprobe /opt/conda/bin/ffprobe \
+    && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libopus \
+    && conda clean -afy
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install "vllm==${VLLM_VERSION}" -r requirements.txt

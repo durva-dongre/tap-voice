@@ -231,7 +231,7 @@ jobs:
             echo "| SNAC revision | \`${SNAC}\` |"
             echo "| FP8 repo | \`${PREQUANTIZED_REPO}@${PREQ_REV}\` |"
             echo "| vLLM version | \`${VLLM}\` |"
-            echo "| Quantization | FP8 weights, BF16 embeddings and lm_head |"
+            echo "| Quantization | see verify_image log: checkpoint-declared, or vLLM fp8 at load |"
             echo "| Buildcache pushed | ${PUSH_CACHE} |"
           } >> "$GITHUB_STEP_SUMMARY"
 

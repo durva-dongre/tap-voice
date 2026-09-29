@@ -39,7 +39,7 @@ SENTENCES = {
 
 def texts_for(language):
     short, medium = SENTENCES[language]
-    return {"short": short, "medium": medium, "long": f"{medium} {short} {medium}"}
+    return {"short": short, "medium": medium, "long": f"{medium} {short}"}
 
 
 def apply_env():

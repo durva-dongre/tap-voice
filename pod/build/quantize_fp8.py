@@ -184,6 +184,16 @@ def check_vocab(dest):
     return size
 
 
+def warn_if_unquantized(dest):
+    with open(os.path.join(dest, "config.json"), encoding="utf-8") as handle:
+        declared = json.load(handle).get("quantization_config")
+    if not declared:
+        sys.stderr.write(
+            "quantize_fp8 warning: checkpoint has no quantization_config; "
+            "weights are full precision on disk and vLLM will quantize at load\n"
+        )
+
+
 def record_manifest(models_dir, dest, source, revision):
     files = {}
     for rel in walk_files(dest):
@@ -218,6 +228,7 @@ def main():
             quantize_local(raw, dest)
             revision = env("SVARA_REVISION", "local")
         vocab = check_vocab(dest)
+        warn_if_unquantized(dest)
         files = record_manifest(models_dir, dest, source, revision)
     except BuildError as exc:
         sys.stderr.write(f"quantize_fp8 failed: {redact(exc)}\n")

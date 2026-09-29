@@ -1,4 +1,3 @@
-"""Build-time checks. Runs on a CPU-only CI runner, so nothing here needs a GPU."""
 import importlib
 import importlib.metadata
 import importlib.util
@@ -14,6 +13,7 @@ if ROOT not in sys.path:
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/models/svara-fp8")
 SNAC_DIR = os.environ.get("SNAC_DIR", "/opt/models/snac_24khz")
+FFMPEG = os.environ.get("FFMPEG_BIN") or "ffmpeg"
 
 problems = []
 notes = []
@@ -31,10 +31,18 @@ def has_weights(path):
     return any(n.endswith((".safetensors", ".bin", ".pt")) for n in os.listdir(path))
 
 
+def encoders_of(binary):
+    return subprocess.run(
+        [binary, "-hide_banner", "-encoders"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).stdout.decode()
+
+
 def model_files():
-    for name in ("config.json",):
-        if not os.path.isfile(os.path.join(MODEL_DIR, name)):
-            raise RuntimeError(f"missing {name} in {MODEL_DIR}")
+    if not os.path.isfile(os.path.join(MODEL_DIR, "config.json")):
+        raise RuntimeError(f"missing config.json in {MODEL_DIR}")
     if not any(n.endswith(".safetensors") for n in os.listdir(MODEL_DIR)):
         raise RuntimeError("no .safetensors weights in model dir")
     if not (
@@ -47,7 +55,7 @@ def model_files():
     quant = config.get("quantization_config")
     if quant:
         return f"checkpoint declares quantization {quant.get('quant_method')}"
-    return "no quantization_config: the engine will apply fp8 itself"
+    return "no quantization_config: the engine will apply fp8 itself at load time"
 
 
 def snac_files():
@@ -91,21 +99,32 @@ def gcc_present():
     return path
 
 
+def ffmpeg_path():
+    resolved = shutil.which(FFMPEG)
+    if not resolved:
+        raise RuntimeError(f"{FFMPEG} not found")
+    if "libopus" not in encoders_of(resolved):
+        raise RuntimeError(f"{resolved} has no libopus encoder")
+    return resolved
+
+
+def bare_ffmpeg():
+    resolved = shutil.which("ffmpeg")
+    if not resolved:
+        raise RuntimeError("ffmpeg not on PATH")
+    if "libopus" not in encoders_of(resolved):
+        raise RuntimeError(f"ffmpeg on PATH ({resolved}) has no libopus encoder")
+    return resolved
+
+
 def opus_ok():
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("ffmpeg not found")
-    encoders = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False
-    ).stdout.decode()
-    if "libopus" not in encoders:
-        raise RuntimeError("ffmpeg has no libopus encoder")
     import numpy as np
 
     from app.audio import OpusEncoder
 
     t = np.arange(16000) / 16000.0
     pcm = (np.sin(2 * np.pi * 300 * t) * 12000).astype(np.int16)
-    data = OpusEncoder(16000, "24k").encode(pcm)
+    data = OpusEncoder(16000, "24k", FFMPEG).encode(pcm)
     if len(data) < 500:
         raise RuntimeError("opus output is suspiciously small")
     return f"{len(data)} bytes for 1 s"
@@ -132,6 +151,8 @@ for label, fn in (
     ("imports", imports_ok),
     ("app modules", app_modules),
     ("gcc", gcc_present),
+    ("ffmpeg binary", ffmpeg_path),
+    ("ffmpeg on PATH", bare_ffmpeg),
     ("opus encode", opus_ok),
     ("entrypoint", entrypoint_present),
     ("non-root user", runs_as_non_root),

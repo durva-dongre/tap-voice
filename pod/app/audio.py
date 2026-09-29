@@ -1,4 +1,5 @@
 import io
+import os
 import subprocess
 import threading
 
@@ -8,6 +9,10 @@ import soxr
 
 _LOCAL = threading.local()
 _OGG_MAGIC = b"OggS"
+
+
+def ffmpeg_binary():
+    return os.environ.get("FFMPEG_BIN") or "ffmpeg"
 
 
 def trim_edges(audio, sample_rate, threshold, pad_seconds):
@@ -84,10 +89,10 @@ def encode_wav(audio, sample_rate):
 
 
 class OpusEncoder:
-    def __init__(self, sample_rate, bitrate, ffmpeg="ffmpeg"):
+    def __init__(self, sample_rate, bitrate, ffmpeg=None):
         self.sample_rate = sample_rate
         self.bitrate = bitrate
-        self.ffmpeg = ffmpeg
+        self.ffmpeg = ffmpeg or ffmpeg_binary()
 
     def encode(self, pcm):
         command = [
@@ -140,7 +145,11 @@ def encode_ogg(audio, settings):
     )
     encoder = getattr(_LOCAL, "encoder", None)
     if encoder is None:
-        encoder = OpusEncoder(settings.opus_sample_rate, settings.opus_bitrate)
+        encoder = OpusEncoder(
+            settings.opus_sample_rate,
+            settings.opus_bitrate,
+            ffmpeg_binary(),
+        )
         _LOCAL.encoder = encoder
     return encoder.encode(to_int16(resampled))
 
