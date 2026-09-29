@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -8,6 +9,8 @@ from typing import List, Optional
 
 from .logits import sampling_restrictions
 from .prompt import EOS, Prepared, bos_id, build_ids
+
+log = logging.getLogger("engine")
 
 
 class FatalEngineError(Exception):
@@ -49,40 +52,109 @@ class Engine:
         self.settings = settings
         self.llm = None
         self.tokenizer = None
+        self.kv_dtype = None
+        self.extras = {}
+        self._params_cls = None
+
+    # ---- configuration -----------------------------------------------------------
+
+    def _gpu_total_mb(self):
+        try:
+            import torch
+
+            return int(torch.cuda.get_device_properties(0).total_memory / (1024 * 1024))
+        except Exception:
+            return self.settings.gpu_total_mb
 
     def utilization(self):
         s = self.settings
-        reserve = s.codec_vram_reserve_mb / float(s.gpu_total_mb)
+        reserve = s.codec_vram_reserve_mb / float(self._gpu_total_mb())
         return max(0.5, min(0.95, s.gpu_memory_utilization - reserve))
 
-    async def start(self):
-        from vllm import AsyncEngineArgs, AsyncLLMEngine
+    def resolve_kv_dtype(self):
+        """FP8 KV cache needs CUDA arch 8.9+ (Ada/Hopper). On Ampere it crashes at the first
+        request inside a Triton kernel, after the model has already been paid for."""
+        requested = (self.settings.kv_cache_dtype or "auto").strip().lower()
+        if not requested.startswith("fp8"):
+            return requested
+        try:
+            import torch
+
+            capability = torch.cuda.get_device_capability(0)
+        except Exception:
+            capability = (0, 0)
+        if capability < (8, 9):
+            log.warning("kv_cache_dtype %s unsupported on arch %s, using auto", requested, capability)
+            return "auto"
+        return requested
+
+    def _probe_extras(self):
+        """Optional CPU savers. Each is used only if this vLLM build accepts it."""
+        from vllm import SamplingParams
 
         s = self.settings
-        args = AsyncEngineArgs(
+        extras = {}
+        if s.skip_detokenize:
+            try:
+                SamplingParams(max_tokens=1, detokenize=False)
+                extras["detokenize"] = False
+            except (TypeError, ValueError):
+                log.warning("detokenize=False not supported by this vLLM")
+        if s.final_only_outputs:
+            try:
+                from vllm.sampling_params import RequestOutputKind
+
+                SamplingParams(max_tokens=1, output_kind=RequestOutputKind.FINAL_ONLY)
+                extras["output_kind"] = RequestOutputKind.FINAL_ONLY
+            except (ImportError, TypeError, ValueError):
+                log.warning("output_kind=FINAL_ONLY not supported by this vLLM")
+        return extras
+
+    async def start(self):
+        from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+
+        s = self.settings
+        self._params_cls = SamplingParams
+        self.kv_dtype = self.resolve_kv_dtype()
+        steps = max(1, s.num_scheduler_steps)
+        kwargs = dict(
             model=s.model_dir,
             tokenizer=s.model_dir,
             dtype="bfloat16",
             quantization=resolve_quantization(s.model_dir, s.quantization),
-            kv_cache_dtype=s.kv_cache_dtype,
+            kv_cache_dtype=self.kv_dtype,
             max_model_len=s.max_model_len,
             max_num_seqs=s.max_num_seqs,
             gpu_memory_utilization=self.utilization(),
-            enable_prefix_caching=True,
-            enable_chunked_prefill=True,
+            enable_prefix_caching=s.enable_prefix_caching,
+            # Multi-step scheduling and chunked prefill do not combine in vLLM 0.6.x.
+            enable_chunked_prefill=s.enable_chunked_prefill and steps == 1,
             swap_space=0,
             enforce_eager=False,
             disable_log_stats=True,
+            disable_log_requests=True,
         )
-        self.llm = AsyncLLMEngine.from_engine_args(args)
+        if steps > 1:
+            kwargs["num_scheduler_steps"] = steps
+        if s.max_num_batched_tokens > 0:
+            kwargs["max_num_batched_tokens"] = s.max_num_batched_tokens
+        self.llm = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**kwargs))
         self.tokenizer = await self.llm.get_tokenizer()
+        self.extras = self._probe_extras()
+        log.info(
+            "engine_ready kv=%s util=%.3f steps=%d extras=%s",
+            self.kv_dtype,
+            kwargs["gpu_memory_utilization"],
+            steps,
+            sorted(self.extras),
+        )
         return self.tokenizer
 
-    def sampling(self, prepared):
-        from vllm import SamplingParams
+    # ---- generation --------------------------------------------------------------
 
+    def sampling(self, prepared):
         s = self.settings
-        return SamplingParams(
+        return self._params_cls(
             temperature=s.temperature,
             top_p=s.top_p,
             top_k=s.top_k,
@@ -90,7 +162,8 @@ class Engine:
             max_tokens=prepared.max_tokens,
             stop_token_ids=[EOS],
             seed=prepared.seed if s.use_seeds else None,
-            **sampling_restrictions(s.logits_mask),
+            **self.extras,
+            **sampling_restrictions(s.logits_mask, allow_header=s.allow_header_tokens),
         )
 
     def is_dead(self):
@@ -163,13 +236,15 @@ class Engine:
             if in_flight:
                 await asyncio.gather(*in_flight, return_exceptions=True)
 
-    async def warmup(self, voices):
+    async def warmup(self, voices=None):
+        """One tiny request is enough to trigger kernel setup; more only add billed seconds."""
+        chosen = list(voices or [])[: max(1, self.settings.warmup_voices)] or ["English (Female)"]
         bos = bos_id(self.tokenizer)
         prepared = []
-        for index, voice in enumerate(voices):
+        for index, voice in enumerate(chosen):
             ids = build_ids(self.tokenizer, voice, "Warmup.", None, bos)
             prepared.append(
-                Prepared(item=WarmupItem(id=f"warmup-{index}"), prompt_ids=ids, max_tokens=64, seed=1)
+                Prepared(item=WarmupItem(id=f"warmup-{index}"), prompt_ids=ids, max_tokens=48, seed=1)
             )
         async for _ in self.generate(prepared, lambda: False):
             pass

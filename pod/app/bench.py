@@ -126,22 +126,20 @@ async def run_single(settings, count):
     began = time.time()
     engine = Engine(settings)
     await engine.start()
-    codec = Codec(settings.snac_dir)
+    codec = Codec(
+        settings.snac_dir, half=settings.snac_half, tolerance=settings.bad_code_tolerance
+    )
+    codec.warmup()
     await engine.warmup(sorted(ALLOWED_VOICES))
     startup = time.time() - began
 
     items = build_items(settings, count)
-    by_id = {item.id: item for item in items}
-    prepared = sort_by_length(prepare(items, engine.tokenizer, settings))
-
     lock = threading.Lock()
     stage = {"decode": 0.0, "encode": 0.0}
     failures = {}
-    totals = {"tokens": 0, "truncated": 0}
+    totals = {"tokens": 0, "truncated_first_pass": 0, "retried": 0}
     pool = ThreadPoolExecutor(max_workers=settings.upload_threads)
     futures = []
-    buffer = []
-    last = time.time()
     loop = asyncio.get_running_loop()
 
     def note(reason):
@@ -158,13 +156,14 @@ async def run_single(settings, count):
     def encode_job(item, wave):
         start = time.time()
         try:
-            processed, reason = audio.process(wave, settings)
+            processed, reason = audio.process(wave, settings, len(item.text))
             if processed is None:
                 outcome = ("fail", reason, 0.0)
             else:
                 data, _, _ = audio.encode(processed, item.fmt, settings)
-                outcome = ("ok", "", processed.size / float(settings.source_sample_rate))
-                if not data:
+                if data:
+                    outcome = ("ok", "", processed.size / float(settings.source_sample_rate))
+                else:
                     outcome = ("fail", "empty_encode", 0.0)
         except Exception as exc:
             outcome = ("fail", type(exc).__name__, 0.0)
@@ -172,34 +171,54 @@ async def run_single(settings, count):
             stage["encode"] += time.time() - start
         return outcome
 
-    async def drain():
-        nonlocal buffer, last
-        if not buffer:
-            return
+    async def drain(buffer, by_id):
         entries = [(f.key, f.tokens) for f in buffer]
-        buffer = []
-        last = time.time()
         decoded, bad = await loop.run_in_executor(None, timed_decode, entries)
         for _, reason in bad:
             note(reason)
         for key, wave in decoded:
             futures.append(pool.submit(encode_job, by_id[key], wave))
 
+    async def one_pass(batch, attempt):
+        """Same retry rule as production: a cut-off clip is generated again, and both
+        generations are billed. Returns the clips that were cut off."""
+        prepared = sort_by_length(prepare(batch, engine.tokenizer, settings, attempt=attempt))
+        by_id = {p.item.id: p.item for p in prepared}
+        buffer = []
+        last = time.time()
+        cut_off = []
+        async for finished in engine.generate(prepared, lambda: False):
+            if finished.error:
+                note(finished.error)
+                continue
+            totals["tokens"] += len(finished.tokens)
+            if finished.finish_reason == "length":
+                if attempt == 0:
+                    totals["truncated_first_pass"] += 1
+                cut_off.append(by_id[finished.key])
+                continue
+            buffer.append(finished)
+            if (
+                len(buffer) >= settings.decode_microbatch
+                or time.time() - last >= settings.decode_flush_seconds
+            ):
+                ready, buffer = buffer, []
+                last = time.time()
+                await drain(ready, by_id)
+        if buffer:
+            await drain(buffer, by_id)
+        return cut_off
+
     run_start = time.time()
-    async for finished in engine.generate(prepared, lambda: False):
-        if finished.error:
-            note(finished.error)
-            continue
-        totals["tokens"] += len(finished.tokens)
-        if finished.finish_reason == "length":
-            totals["truncated"] += 1
-        buffer.append(finished)
-        if (
-            len(buffer) >= settings.decode_microbatch
-            or time.time() - last >= settings.decode_flush_seconds
-        ):
-            await drain()
-    await drain()
+    pending = items
+    for attempt in range(settings.max_retries + 1):
+        if not pending:
+            break
+        if attempt > 0:
+            totals["retried"] += len(pending)
+        pending = await one_pass(pending, attempt)
+    for _ in pending:
+        note("truncated")
     generate_wall = time.time() - run_start
 
     ok = 0
@@ -224,12 +243,16 @@ async def run_single(settings, count):
         "max_num_seqs": settings.max_num_seqs,
         "decode_microbatch": settings.decode_microbatch,
         "gpu_memory_utilization": settings.gpu_memory_utilization,
+        "logits_mask": settings.logits_mask,
+        "num_scheduler_steps": settings.num_scheduler_steps,
+        "kv_cache_dtype": engine.kv_dtype,
         "gpu_hourly_rate": settings.gpu_hourly_rate,
         "clips_total": count,
         "clips_ok": ok,
         "fail_rate": round((count - ok) / float(count), 4),
         "failure_reasons": failures,
-        "truncated_clips": totals["truncated"],
+        "truncated_clips": totals["truncated_first_pass"],
+        "retried_clips": totals["retried"],
         "startup_seconds": round(startup, 1),
         "wall_seconds": round(wall, 2),
         "generate_wall_seconds": round(generate_wall, 2),
@@ -258,6 +281,10 @@ def single(args):
         "gpu_memory_utilization": args.gpu_util,
         "gpu_hourly_rate": args.rate,
     }
+    if args.logits_mask:
+        overrides["logits_mask"] = args.logits_mask
+    if args.scheduler_steps > 0:
+        overrides["num_scheduler_steps"] = args.scheduler_steps
     if gpu:
         overrides["gpu_total_mb"] = int(gpu[2])
     if args.model_dir:
@@ -269,7 +296,7 @@ def single(args):
     os._exit(0)
 
 
-def run_child(args, seqs, micro, util):
+def run_child(args, seqs, micro, util, mask, steps):
     command = [
         sys.executable,
         "-m",
@@ -285,12 +312,23 @@ def run_child(args, seqs, micro, util):
         str(util),
         "--rate",
         str(args.rate),
+        "--logits-mask",
+        mask,
+        "--scheduler-steps",
+        str(steps),
     ]
     if args.model_dir:
         command += ["--model-dir", args.model_dir]
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    log_path = os.path.join(args.out_dir, f"run_s{seqs}_m{micro}_u{util}.log")
-    base = {"max_num_seqs": seqs, "decode_microbatch": micro, "gpu_memory_utilization": util}
+    tag = f"s{seqs}_m{micro}_u{util}_{mask or 'default'}_k{steps}"
+    log_path = os.path.join(args.out_dir, f"run_{tag}.log")
+    base = {
+        "max_num_seqs": seqs,
+        "decode_microbatch": micro,
+        "gpu_memory_utilization": util,
+        "logits_mask": mask or "default",
+        "num_scheduler_steps": steps or 1,
+    }
     with open(log_path, "w") as log:
         try:
             proc = subprocess.run(
@@ -310,21 +348,29 @@ def run_child(args, seqs, micro, util):
 
 
 def print_rows(rows):
-    header = f"{'gpu':<20}{'seqs':>5}{'mb':>4}{'util':>6}{'ok':>11}{'clips/min':>10}{'tok/s':>8}{'vramMB':>8}{'rssMB':>7}{'$/1000':>9}"
-    sys.stdout.write(header + "\n")
+    header = (
+        f"{'gpu':<20}{'seqs':>5}{'mb':>4}{'util':>6}{'mask':>7}{'k':>3}{'kv':>6}"
+        f"{'ok':>11}{'clips/min':>10}{'tok/s':>8}{'gpu%':>6}{'vramMB':>8}{'$/1000':>9}\n"
+    )
+    sys.stdout.write(header)
     for row in rows:
         name = str(row.get("gpu_name", "-"))[:19]
-        lead = f"{name:<20}{row['max_num_seqs']:>5}{row['decode_microbatch']:>4}{row['gpu_memory_utilization']:>6}"
+        lead = (
+            f"{name:<20}{row['max_num_seqs']:>5}{row['decode_microbatch']:>4}"
+            f"{row['gpu_memory_utilization']:>6}{str(row.get('logits_mask', '-')):>7}"
+            f"{row.get('num_scheduler_steps', 1):>3}{str(row.get('kv_cache_dtype', '-')):>6}"
+        )
         if row.get("error"):
             sys.stdout.write(lead + f"  FAILED: {row['error']}\n")
             continue
         ok = f"{row['clips_ok']}/{row['clips_total']}"
         cost = row["cost_per_1000_usd"]
         cost_text = f"{cost:.4f}" if cost is not None else "-"
+        util = row.get("avg_gpu_util_pct")
         sys.stdout.write(
             lead
             + f"{ok:>11}{row['clips_per_minute']:>10}{row['tokens_per_second']:>8}"
-            + f"{row['peak_vram_mb']:>8}{row['peak_rss_mb']:>7}{cost_text:>9}\n"
+            + f"{(util if util is not None else '-'):>6}{row['peak_vram_mb']:>8}{cost_text:>9}\n"
         )
 
 
@@ -344,12 +390,17 @@ def report_best(rows, max_fail):
         return 1
     sys.stdout.write(
         f"\nbest: {best['gpu_name']} at ${best['cost_per_1000_usd']:.4f} per 1000 clips, "
-        f"{best['clips_per_minute']} clips/min, peak VRAM {best['peak_vram_mb']} MB\n"
+        f"{best['clips_per_minute']} clips/min, peak VRAM {best['peak_vram_mb']} MB, "
+        f"first-pass truncated {best.get('truncated_clips', 0)}\n"
         f"MAX_NUM_SEQS={best['max_num_seqs']} DECODE_MICROBATCH={best['decode_microbatch']} "
-        f"GPU_MEMORY_UTILIZATION={best['gpu_memory_utilization']}\n"
+        f"GPU_MEMORY_UTILIZATION={best['gpu_memory_utilization']} "
+        f"LOGITS_MASK={best.get('logits_mask', 'range')} "
+        f"NUM_SCHEDULER_STEPS={best.get('num_scheduler_steps', 1)}\n"
     )
     per_clip = best["wall_seconds"] / max(best["clips_ok"], 1)
     sys.stdout.write(f"suggested SECONDS_PER_ITEM_CAP={round(per_clip * 2, 2)} (2x measured {per_clip:.2f}s/clip)\n")
+    if (best.get("avg_gpu_util_pct") or 100) < 70:
+        sys.stdout.write("note: GPU under 70% busy, the CPU side is the limit; try NUM_SCHEDULER_STEPS=4 or fewer upload threads\n")
     return 0
 
 
@@ -358,13 +409,19 @@ def sweep(args):
     seqs_list = [int(v) for v in args.seqs.split(",")]
     micro_list = [int(v) for v in args.microbatch.split(",")]
     util_list = [float(v) for v in args.gpu_util_list.split(",")]
+    mask_list = [v.strip() for v in args.masks.split(",")] if args.masks else [""]
+    step_list = [int(v) for v in args.steps.split(",")] if args.steps else [0]
     rows = []
     for util in util_list:
         for micro in micro_list:
-            for seqs in seqs_list:
-                sys.stdout.write(f"running seqs={seqs} microbatch={micro} util={util}\n")
-                sys.stdout.flush()
-                rows.append(run_child(args, seqs, micro, util))
+            for mask in mask_list:
+                for steps in step_list:
+                    for seqs in seqs_list:
+                        sys.stdout.write(
+                            f"running seqs={seqs} microbatch={micro} util={util} mask={mask or 'default'} steps={steps or 1}\n"
+                        )
+                        sys.stdout.flush()
+                        rows.append(run_child(args, seqs, micro, util, mask, steps))
     rows.sort(key=lambda r: (r.get("error") is not None, r.get("cost_per_1000_usd") or 1e9))
     sys.stdout.write("\n")
     print_rows(rows)
@@ -388,12 +445,16 @@ def parse():
     parser.add_argument("--single", action="store_true")
     parser.add_argument("--compare", nargs="+")
     parser.add_argument("--count", type=int, default=240)
-    parser.add_argument("--seqs", default="16,32,48,64")
+    parser.add_argument("--seqs", default="32,64,96")
     parser.add_argument("--microbatch", default="8")
     parser.add_argument("--gpu-util-list", default="0.90")
+    parser.add_argument("--masks", default="", help="comma list of range,none (empty = configured default)")
+    parser.add_argument("--steps", default="", help="comma list of num_scheduler_steps (empty = 1)")
     parser.add_argument("--max-num-seqs", type=int, default=48)
     parser.add_argument("--decode-microbatch", type=int, default=8)
     parser.add_argument("--gpu-util", type=float, default=0.90)
+    parser.add_argument("--logits-mask", default="")
+    parser.add_argument("--scheduler-steps", type=int, default=0)
     parser.add_argument("--rate", type=float, default=float(os.environ.get("GPU_HOURLY_RATE", "0.34") or 0.34))
     parser.add_argument("--model-dir", default="")
     parser.add_argument("--timeout", type=int, default=1800)

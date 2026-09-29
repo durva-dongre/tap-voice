@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import contextlib
 import logging
 import threading
@@ -10,6 +11,28 @@ from .control import ClientError, Stop, stop_event
 from .prompt import fits_context, prepare, sort_by_length
 
 log = logging.getLogger("pipeline")
+
+# Problems with one clip's content. They cost a retry but say nothing about the machine, so
+# they never trip the consecutive-failure breaker (longest-first ordering front-loads them).
+CONTENT_REASONS = frozenset(
+    {
+        "empty",
+        "non_finite",
+        "silent",
+        "too_short",
+        "too_long",
+        "pace_short",
+        "pace_long",
+        "too_few_tokens",
+        "bad_codes",
+        "truncated",
+        "prompt_too_long",
+    }
+)
+
+# On the first pass a cut-off clip is expected: the token cap is an estimate and the retry
+# exists for exactly this. It is counted in telemetry but not held against the run.
+SOFT_FIRST_PASS = frozenset({"truncated"})
 
 
 class Pipeline:
@@ -41,8 +64,9 @@ class Pipeline:
         self.state_lock = threading.RLock()
         self.last_progress = time.time()
         self.consecutive_failures = 0
+        self.window = collections.deque(maxlen=max(10, settings.breaker_window))
+        self.attempt = 0
         self.tripped = None
-        self.attempt_failures = []
         self.last_reason = {}
 
     # ---- bookkeeping -------------------------------------------------------------
@@ -70,6 +94,7 @@ class Pipeline:
         with self.state_lock:
             self.consecutive_failures = 0
             self.last_progress = time.time()
+            self.window.append(True)
 
     def _trip(self, reason):
         with self.state_lock:
@@ -77,15 +102,26 @@ class Pipeline:
                 self.tripped = reason
         stop_event.set()
 
+    def _check_window(self):
+        window = self.window
+        if len(window) < window.maxlen:
+            return
+        failures = sum(1 for ok in window if not ok)
+        if failures / float(len(window)) > self.s.breaker_fail_ratio:
+            self._trip("failure_rate")
+
     def _add_failure(self, item, reason, count=True):
         self.tel.fail(reason)
         with self.state_lock:
-            self.attempt_failures.append((item, reason))
             self.last_reason[item.id] = reason
-            if count:
+            if not count or (reason in SOFT_FIRST_PASS and self.attempt == 0):
+                return
+            self.window.append(False)
+            if reason not in CONTENT_REASONS:
                 self.consecutive_failures += 1
                 if self.consecutive_failures >= self.s.max_consecutive_failures:
                     self._trip("consecutive_failures")
+            self._check_window()
 
     def _guards(self):
         with self.state_lock:
@@ -156,7 +192,7 @@ class Pipeline:
 
     def _encode_upload(self, item, wave):
         try:
-            processed, reason = audio.process(wave, self.s)
+            processed, reason = audio.process(wave, self.s, len(item.text))
             if processed is None:
                 self._add_failure(item, reason)
                 return
@@ -265,8 +301,8 @@ class Pipeline:
                 if stop_event.is_set():
                     break
                 with self.state_lock:
+                    self.attempt = attempt
                     self.last_progress = time.time()
-                    self.attempt_failures = []
                 if attempt > 0:
                     self.tel.add("retried", len(current))
                 prepared = prepare(current, self.engine.tokenizer, self.s, attempt=attempt)

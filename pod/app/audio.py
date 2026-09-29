@@ -53,33 +53,56 @@ def loudness_normalize(audio, target_db, peak_target):
     return scaled
 
 
-def validate(audio, sample_rate, settings):
-    if audio is None or audio.size == 0:
-        return "empty"
-    if not np.isfinite(audio).all():
-        return "non_finite"
+def fade_edges(audio, sample_rate, seconds):
+    """Short fade in/out so decoder padding or a hard trim never leaves a click."""
+    n = min(int(seconds * sample_rate), audio.size // 2)
+    if n <= 0:
+        return audio
+    out = np.array(audio, dtype=np.float32, copy=True)
+    ramp = np.linspace(0.0, 1.0, n, endpoint=False, dtype=np.float32)
+    out[:n] *= ramp
+    out[-n:] *= ramp[::-1]
+    return out
+
+
+def check_shape(audio, sample_rate, settings, text_chars):
+    """Duration checks on the trimmed clip. Cheap, and catches loops, babble and cut-offs
+    before they are cached (and served) for a year."""
     duration = audio.size / float(sample_rate)
     if duration < settings.min_duration:
         return "too_short"
     if duration > settings.max_duration:
         return "too_long"
-    if rms(audio) < settings.rms_gate:
-        return "silent"
+    if settings.quality_pace_gate and text_chars:
+        if duration < text_chars * settings.min_sec_per_char:
+            return "pace_short"
+        if duration > text_chars * settings.max_sec_per_char + settings.pace_slack_seconds:
+            return "pace_long"
     return None
 
 
-def process(audio, settings):
+def process(audio, settings, text_chars=None):
+    """Returns (float32 audio, None) or (None, reason).
+
+    Silence is judged on the raw level. Judging it after peak normalisation would let
+    noise-only output through, because normalising makes any signal look loud.
+    """
+    if audio is None or audio.size == 0:
+        return None, "empty"
+    if not np.isfinite(audio).all():
+        return None, "non_finite"
     sr = settings.source_sample_rate
     trimmed = trim_edges(audio, sr, settings.trim_threshold, settings.trim_pad_seconds)
-    normalized = peak_normalize(trimmed, settings.peak_target)
-    reason = validate(normalized, sr, settings)
+    if trimmed.size == 0 or rms(trimmed) < settings.rms_gate:
+        return None, "silent"
+    reason = check_shape(trimmed, sr, settings, text_chars)
     if reason is not None:
         return None, reason
+    out = peak_normalize(trimmed, settings.peak_target)
     if settings.loudness_normalize:
-        normalized = loudness_normalize(
-            normalized, settings.loudness_target_db, settings.peak_target
-        )
-    return normalized.astype(np.float32, copy=False), None
+        out = loudness_normalize(out, settings.loudness_target_db, settings.peak_target)
+    out = fade_edges(out, sr, settings.fade_seconds)
+    return out.astype(np.float32, copy=False), None
 
 
 def encode_wav(audio, sample_rate):

@@ -6,6 +6,10 @@ SOH = 128259
 EOT = 128009
 EOH = 128260
 EOS = 128258
+START_OF_SPEECH = 128257
+START_OF_AI = 128261
+# Orpheus-style models normally emit these before the first audio token. The codec drops them.
+HEADER_TOKENS = (START_OF_AI, START_OF_SPEECH)
 AUDIO_OFFSET = 128266
 AUDIO_END = AUDIO_OFFSET + 7 * 4096
 DEFAULT_BOS = 128000
@@ -51,6 +55,24 @@ def estimate_max_tokens(text, settings):
     return max(settings.min_max_tokens, min(settings.max_max_tokens, estimate))
 
 
+def attempt_cap(text, room, settings, attempt):
+    """Token cap per attempt.
+
+    First pass: the length estimate (a rambling clip is cut off cheaply).
+    Second pass: 1.5x the estimate, so a clip that was only slightly short still gets through.
+    Later passes: everything the context allows. A clip that loops forever therefore burns
+    the full window at most once, not on every retry.
+    """
+    estimate = estimate_max_tokens(text, settings)
+    if attempt <= 0:
+        cap = estimate
+    elif attempt == 1:
+        cap = int(estimate * settings.retry_growth)
+    else:
+        cap = room
+    return max(1, min(room, cap))
+
+
 def seed_from_hash(content_hash, base_seed, attempt):
     return (int(content_hash[:12], 16) + base_seed + attempt * 7919) % (2**31 - 1)
 
@@ -67,21 +89,16 @@ def _prompt_ids(items, tokenizer):
 
 
 def prepare(items, tokenizer, settings, attempt=0):
-    """Build prompts. max_tokens never exceeds the space left in the context window.
-
-    First attempt uses the length estimate as a cap (cheap when the model rambles).
-    Retries use all remaining room, so a clip that was cut off gets its full chance.
-    """
+    """Build prompts. max_tokens never exceeds the space left in the context window."""
     ids_list = _prompt_ids(items, tokenizer)
     out = []
     for item, ids in zip(items, ids_list):
         room = settings.max_model_len - len(ids) - CONTEXT_SLACK
-        cap = room if attempt > 0 else min(room, estimate_max_tokens(item.text, settings))
         out.append(
             Prepared(
                 item=item,
                 prompt_ids=ids,
-                max_tokens=max(cap, 1),
+                max_tokens=attempt_cap(item.text, room, settings, attempt),
                 seed=seed_from_hash(item.content_hash, settings.base_seed, attempt),
                 room=room,
             )

@@ -95,23 +95,43 @@ class Store:
             return f"http://127.0.0.1:{self.settings.local_port}/{key}"
         return f"{self.settings.cdn_base_url}/{key}"
 
-    def load_existing(self):
-        names = set()
+    def _prefixes(self, languages):
+        base = self.settings.gcs_prefix
+        if not languages:
+            return [f"{base}/"]
+        return [f"{base}/{language}/" for language in sorted(set(languages))]
+
+    def probe_list(self):
+        """Cheap check that listing works (production needs storage.objects.list)."""
+        if self.local:
+            return True
         prefix = f"{self.settings.gcs_prefix}/"
+        for _ in self.client.list_blobs(
+            self.settings.gcs_bucket, prefix=prefix, max_results=1, fields="items(name),nextPageToken"
+        ):
+            break
+        return True
+
+    def load_existing(self, languages=None):
+        """Remember which clips already exist. Pass the batch's languages to list only those
+        folders; listing the whole prefix gets slower every month as the library grows, and it
+        is billed startup time."""
+        names = set()
+        prefixes = self._prefixes(languages)
         if self.local:
             for base, _, files in os.walk(self.root):
                 for name in files:
-                    rel = os.path.relpath(os.path.join(base, name), self.root)
-                    rel = rel.replace(os.sep, "/")
-                    if rel.startswith(prefix):
+                    rel = os.path.relpath(os.path.join(base, name), self.root).replace(os.sep, "/")
+                    if any(rel.startswith(prefix) for prefix in prefixes):
                         names.add(rel)
         else:
-            for blob in self.client.list_blobs(
-                self.settings.gcs_bucket,
-                prefix=prefix,
-                fields="items(name),nextPageToken",
-            ):
-                names.add(blob.name)
+            for prefix in prefixes:
+                for blob in self.client.list_blobs(
+                    self.settings.gcs_bucket,
+                    prefix=prefix,
+                    fields="items(name),nextPageToken",
+                ):
+                    names.add(blob.name)
         with self.lock:
             self.existing = names
         return len(names)

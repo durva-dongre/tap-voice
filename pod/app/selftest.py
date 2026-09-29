@@ -8,7 +8,7 @@ from . import audio, config
 from .codec import Codec
 from .engine import Engine
 from .manifest import Item, content_hash
-from .prompt import prepare
+from .prompt import fits_context, prepare
 from .storage import Store
 from .voices import LANGUAGE_VOICES
 
@@ -21,22 +21,42 @@ SAMPLES = {
 }
 
 
+def make_item(settings, item_id, language, text):
+    voice = LANGUAGE_VOICES[language]
+    return Item(
+        id=item_id,
+        text=text,
+        language=language,
+        voice=voice,
+        emotion=None,
+        fmt="ogg",
+        content_hash=content_hash(text, voice, None, "ogg", settings.model_revision),
+    )
+
+
 def build_items(settings):
-    items = []
+    return [make_item(settings, f"selftest-{lang}", lang, text) for lang, text in SAMPLES.items()]
+
+
+def root_cause(exc):
+    """Innermost exception in the chain, flattened to one line."""
+    while exc.__cause__ is not None:
+        exc = exc.__cause__
+    text = f"{type(exc).__name__}: {exc}"
+    return " ".join(text.replace(",", ";").split())[:240]
+
+
+def context_failures(settings, tokenizer):
+    """Tokenizer only, no GPU: a maximum-length text in every language must leave enough
+    context for its audio. Otherwise those items would fail for good in production."""
+    failures = []
     for language, text in SAMPLES.items():
-        voice = LANGUAGE_VOICES[language]
-        items.append(
-            Item(
-                id=f"selftest-{language}",
-                text=text,
-                language=language,
-                voice=voice,
-                emotion=None,
-                fmt="ogg",
-                content_hash=content_hash(text, voice, None, "ogg", settings.model_revision),
-            )
-        )
-    return items
+        long_text = " ".join([text] * 40)[: settings.max_text_chars]
+        item = make_item(settings, f"context-{language}", language, long_text)
+        prepared = prepare([item], tokenizer, settings)[0]
+        if not fits_context(prepared, settings):
+            failures.append(f"context_{language}:room_{prepared.room}")
+    return failures
 
 
 def check_upload(store, item, data, content_type, ext):
@@ -54,14 +74,18 @@ async def run(settings):
     failures = []
     store = Store(settings)
     try:
-        # Production needs storage.objects.list; fail here instead of after the model loads.
-        store.load_existing()
+        store.probe_list()
     except Exception as exc:
         return [f"gcs_list_failed:{type(exc).__name__}"]
     engine = Engine(settings)
     try:
         await engine.start()
-        codec = Codec(settings.snac_dir)
+        sys.stdout.write(f"selftest_info kv_cache_dtype={engine.kv_dtype} extras={sorted(engine.extras)}\n")
+        codec = Codec(
+            settings.snac_dir, half=settings.snac_half, tolerance=settings.bad_code_tolerance
+        )
+        codec.warmup()
+        failures += context_failures(settings, engine.tokenizer)
         items = build_items(settings)
         prepared = prepare(items, engine.tokenizer, settings)
         by_id = {p.item.id: p.item for p in prepared}
@@ -80,7 +104,7 @@ async def run(settings):
         failures += [f"{k}:{r}" for k, r in bad]
         for key, wave in decoded:
             item = by_id[key]
-            processed, reason = audio.process(wave, settings)
+            processed, reason = audio.process(wave, settings, len(item.text))
             if processed is None:
                 failures.append(f"{key}:{reason}")
                 continue
@@ -88,6 +112,8 @@ async def run(settings):
             failure = check_upload(store, item, data, content_type, ext)
             if failure:
                 failures.append(failure)
+    except Exception as exc:
+        failures.append(f"engine:{root_cause(exc)}")
     finally:
         await engine.shutdown()
     return failures

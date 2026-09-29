@@ -17,17 +17,22 @@ from .voices import ALLOWED_VOICES
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("main")
 
-
+# Both are BaseException so no library's `except Exception` can swallow them.
 class Timeout(BaseException):
     pass
 
 
-def _alarm(*_):
-    raise Timeout()
-
-
-class StartupTimeout(Exception):
+class StartupTimeout(BaseException):
     pass
+
+
+_PHASE = {"name": "startup"}
+
+
+def _alarm(*_):
+    if _PHASE["name"] == "startup":
+        raise StartupTimeout()
+    raise Timeout()
 
 
 def report_rejected(control, rejected):
@@ -47,9 +52,30 @@ def report_rejected(control, rejected):
         log.warning("reject_report_failed %s", type(exc).__name__)
 
 
+def report_existing(control, store, items, telemetry):
+    """Everything is already stored: tell the server and finish without touching the GPU."""
+    records = [
+        {
+            "id": item.id,
+            "status": "done",
+            "url": store.url_for_key(store.key_for(item)),
+            "error": None,
+            "content_hash": item.content_hash,
+        }
+        for item in items
+    ]
+    for start in range(0, len(records), 200):
+        control.progress(records[start : start + 200])
+    telemetry.add("skipped_existing", len(records))
+
+
 async def load_engine(settings, engine):
-    await asyncio.wait_for(engine.start(), timeout=settings.startup_timeout_seconds)
-    return Codec(settings.snac_dir)
+    # engine.start() blocks the event loop while the model loads, so asyncio cannot time it
+    # out. The SIGALRM set in body() is the real guard.
+    await engine.start()
+    return Codec(
+        settings.snac_dir, half=settings.snac_half, tolerance=settings.bad_code_tolerance
+    )
 
 
 async def body(settings, control, heartbeat, telemetry, deadline):
@@ -60,23 +86,33 @@ async def body(settings, control, heartbeat, telemetry, deadline):
     report_rejected(control, rejected)
     if not items:
         return "empty"
-    limit = config.hard_limit_seconds(settings, len(items))
-    remaining_budget = max(60, int(deadline - time.time()))
-    signal.alarm(min(limit, remaining_budget))
+
     heartbeat.set("loading_storage", len(items))
     store = Store(settings)
-    store.load_existing()
-    heartbeat.set("loading_engine", len(items))
+    store.load_existing(sorted({item.language for item in items}))
+    pending = [item for item in items if not store.exists(store.key_for(item))]
+    if not pending:
+        report_existing(control, store, items, telemetry)
+        return "completed"
+
+    heartbeat.set("loading_engine", len(pending))
+    _PHASE["name"] = "startup"
+    signal.alarm(settings.startup_timeout_seconds + settings.startup_alarm_margin_seconds)
     engine = Engine(settings)
     try:
         codec = await load_engine(settings, engine)
         await asyncio.wait_for(
             engine.warmup(sorted(ALLOWED_VOICES)), timeout=settings.startup_timeout_seconds
         )
+        codec.warmup()
     except asyncio.TimeoutError as exc:
         await engine.shutdown()
         raise StartupTimeout() from exc
     telemetry.mark_ready()
+
+    _PHASE["name"] = "run"
+    remaining_budget = max(60, int(deadline - time.time()))
+    signal.alarm(min(config.run_limit_seconds(settings, len(pending)), remaining_budget))
     pipeline = Pipeline(settings, engine, codec, store, control, telemetry, heartbeat)
     try:
         failed, tripped = await pipeline.run(items)
