@@ -10,6 +10,8 @@ AUDIO_OFFSET = 128266
 AUDIO_END = AUDIO_OFFSET + 7 * 4096
 DEFAULT_BOS = 128000
 
+CONTEXT_SLACK = 16
+
 TAG_END = re.compile(r"<[a-z]+>\s*$")
 
 _ID_CACHE = {}
@@ -21,6 +23,7 @@ class Prepared:
     prompt_ids: List[int]
     max_tokens: int
     seed: int
+    room: int = 0
 
 
 def text_with_emotion(text, emotion):
@@ -64,20 +67,37 @@ def _prompt_ids(items, tokenizer):
 
 
 def prepare(items, tokenizer, settings, attempt=0):
+    """Build prompts. max_tokens never exceeds the space left in the context window.
+
+    First attempt uses the length estimate as a cap (cheap when the model rambles).
+    Retries use all remaining room, so a clip that was cut off gets its full chance.
+    """
     ids_list = _prompt_ids(items, tokenizer)
-    return [
-        Prepared(
-            item=item,
-            prompt_ids=ids,
-            max_tokens=estimate_max_tokens(item.text, settings),
-            seed=seed_from_hash(item.content_hash, settings.base_seed, attempt),
+    out = []
+    for item, ids in zip(items, ids_list):
+        room = settings.max_model_len - len(ids) - CONTEXT_SLACK
+        cap = room if attempt > 0 else min(room, estimate_max_tokens(item.text, settings))
+        out.append(
+            Prepared(
+                item=item,
+                prompt_ids=ids,
+                max_tokens=max(cap, 1),
+                seed=seed_from_hash(item.content_hash, settings.base_seed, attempt),
+                room=room,
+            )
         )
-        for item, ids in zip(items, ids_list)
-    ]
+    return out
 
 
-def sort_by_length(prepared):
-    return sorted(prepared, key=lambda p: p.max_tokens)
+def fits_context(prepared, settings):
+    """True if the context window can hold the audio this text is expected to need."""
+    needed = int(len(prepared.item.text) * settings.min_tokens_per_char)
+    return prepared.room >= needed
+
+
+def sort_by_length(prepared, longest_first=True):
+    # Longest first keeps the GPU full to the end instead of leaving long clips for the tail.
+    return sorted(prepared, key=lambda p: p.max_tokens, reverse=longest_first)
 
 
 def clear_cache():

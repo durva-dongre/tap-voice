@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 
 import requests
@@ -50,31 +51,45 @@ def check_upload(store, item, data, content_type, ext):
 
 
 async def run(settings):
-    engine = Engine(settings)
-    await engine.start()
-    codec = Codec(settings.snac_dir)
+    failures = []
     store = Store(settings)
-    items = build_items(settings)
-    prepared = prepare(items, engine.tokenizer, settings)
-    by_id = {p.item.id: p.item for p in prepared}
-    finished = []
-    async for result in engine.generate(prepared, lambda: False):
-        finished.append(result)
-    entries = [(f.key, f.tokens) for f in finished if not f.error]
-    decoded, bad = codec.decode_batch(entries)
-    failures = [f"{k}:{r}" for k, r in bad]
-    failures += [f"{f.key}:{f.error}" for f in finished if f.error]
-    for key, wave in decoded:
-        item = by_id[key]
-        processed, reason = audio.process(wave, settings)
-        if processed is None:
-            failures.append(f"{key}:{reason}")
-            continue
-        data, content_type, ext = audio.encode(processed, "ogg", settings)
-        failure = check_upload(store, item, data, content_type, ext)
-        if failure:
-            failures.append(failure)
-    await engine.shutdown()
+    try:
+        # Production needs storage.objects.list; fail here instead of after the model loads.
+        store.load_existing()
+    except Exception as exc:
+        return [f"gcs_list_failed:{type(exc).__name__}"]
+    engine = Engine(settings)
+    try:
+        await engine.start()
+        codec = Codec(settings.snac_dir)
+        items = build_items(settings)
+        prepared = prepare(items, engine.tokenizer, settings)
+        by_id = {p.item.id: p.item for p in prepared}
+        finished = []
+        async for result in engine.generate(prepared, lambda: False):
+            finished.append(result)
+        good = []
+        for f in finished:
+            if f.error:
+                failures.append(f"{f.key}:{f.error}")
+            elif f.finish_reason == "length":
+                failures.append(f"{f.key}:truncated")
+            else:
+                good.append((f.key, f.tokens))
+        decoded, bad = codec.decode_batch(good)
+        failures += [f"{k}:{r}" for k, r in bad]
+        for key, wave in decoded:
+            item = by_id[key]
+            processed, reason = audio.process(wave, settings)
+            if processed is None:
+                failures.append(f"{key}:{reason}")
+                continue
+            data, content_type, ext = audio.encode(processed, "ogg", settings)
+            failure = check_upload(store, item, data, content_type, ext)
+            if failure:
+                failures.append(failure)
+    finally:
+        await engine.shutdown()
     return failures
 
 
@@ -83,9 +98,13 @@ def main():
     failures = asyncio.run(run(settings))
     if failures:
         sys.stderr.write("selftest_failed " + ",".join(failures) + "\n")
-        sys.exit(1)
+        return 1
     sys.stdout.write("selftest_ok\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

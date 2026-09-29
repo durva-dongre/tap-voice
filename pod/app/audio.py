@@ -1,5 +1,4 @@
 import io
-import queue
 import subprocess
 import threading
 
@@ -128,59 +127,6 @@ class OpusEncoder:
         return result.stdout
 
 
-class PersistentOpusEncoder:
-    def __init__(self, sample_rate, bitrate, ffmpeg="ffmpeg"):
-        self.sample_rate = sample_rate
-        self.bitrate = bitrate
-        self.ffmpeg = ffmpeg
-        self.proc = None
-        self.lock = threading.Lock()
-
-    def _spawn(self):
-        self.proc = subprocess.Popen(
-            [
-                self.ffmpeg,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "s16le",
-                "-ar",
-                str(self.sample_rate),
-                "-ac",
-                "1",
-                "-i",
-                "pipe:0",
-                "-c:a",
-                "libopus",
-                "-b:a",
-                self.bitrate,
-                "-vbr",
-                "constrained",
-                "-application",
-                "voip",
-                "-f",
-                "ogg",
-                "pipe:1",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-
-    def close(self):
-        proc = self.proc
-        self.proc = None
-        if proc is not None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
-    def encode(self, pcm):
-        return OpusEncoder(self.sample_rate, self.bitrate, self.ffmpeg).encode(pcm)
-
-
 def to_int16(audio):
     return (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
 
@@ -210,11 +156,3 @@ def bitrate_bps(value):
     if text.endswith("k"):
         return int(float(text[:-1]) * 1000)
     return int(text)
-
-
-def size_in_band(data_size, duration_seconds, settings):
-    if duration_seconds <= 0:
-        return False
-    actual = data_size * 8.0 / duration_seconds
-    target = bitrate_bps(settings.opus_bitrate)
-    return settings.opus_size_low * target <= actual <= settings.opus_size_high * target

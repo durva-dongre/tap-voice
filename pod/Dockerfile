@@ -24,8 +24,9 @@ ARG VLLM_VERSION
 ENV HF_HOME=/opt/hf HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     MODELS_DIR=/opt/models MODEL_DIR=/opt/models/svara-fp8 SNAC_DIR=/opt/models/snac_24khz \
     HOME=/home/runner
+# gcc: Triton compiles a small C helper the first time a kernel runs (needed with the FP8 KV cache).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg linux-libc-dev \
+    && apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev linux-libc-dev \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 10001 -m runner \
     && mkdir -p /opt/hf && chown 10001:10001 /opt/hf
@@ -35,6 +36,7 @@ RUN pip install "vllm==${VLLM_VERSION}" -r requirements.txt
 COPY --from=models /opt/models /opt/models
 COPY app/ app/
 COPY app/entrypoint.sh entrypoint.sh
+COPY tests/run_suite.py tests/mock_server.py tests/
 COPY build/verify_image.py build/
 RUN chmod +x entrypoint.sh
 USER 10001

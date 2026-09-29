@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import os
 import signal
+import sys
 import time
 
 from . import config, manifest as manifest_mod
@@ -45,7 +47,7 @@ def report_rejected(control, rejected):
         log.warning("reject_report_failed %s", type(exc).__name__)
 
 
-async def load_engine(settings, engine, item_count):
+async def load_engine(settings, engine):
     await asyncio.wait_for(engine.start(), timeout=settings.startup_timeout_seconds)
     return Codec(settings.snac_dir)
 
@@ -67,13 +69,14 @@ async def body(settings, control, heartbeat, telemetry, deadline):
     heartbeat.set("loading_engine", len(items))
     engine = Engine(settings)
     try:
-        codec = await load_engine(settings, engine, len(items))
+        codec = await load_engine(settings, engine)
         await asyncio.wait_for(
             engine.warmup(sorted(ALLOWED_VOICES)), timeout=settings.startup_timeout_seconds
         )
     except asyncio.TimeoutError as exc:
         await engine.shutdown()
         raise StartupTimeout() from exc
+    telemetry.mark_ready()
     pipeline = Pipeline(settings, engine, codec, store, control, telemetry, heartbeat)
     try:
         failed, tripped = await pipeline.run(items)
@@ -93,12 +96,12 @@ def map_reason(exc):
         return "startup_timeout"
     if isinstance(exc, Stop):
         return "stopped"
-    if isinstance(exc, FatalEngineError):
-        return "exception"
     return "exception"
 
 
 def main():
+    """Runs one batch. Always reports completion and asks RunPod to delete the pod.
+    Returns a process exit code."""
     started = time.time()
     reason = "completed"
     settings = None
@@ -134,7 +137,12 @@ def main():
             except Exception:
                 log.exception("complete_failed")
         terminate_self()
+    return 0 if reason.startswith("completed") or reason == "empty" else 1
 
 
 if __name__ == "__main__":
-    main()
+    code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # vLLM background threads can keep the interpreter alive after the work is done.
+    os._exit(code)

@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import threading
 import time
 
@@ -108,17 +109,40 @@ class Heartbeat(threading.Thread):
                 log.warning("heartbeat_failed %s", type(exc).__name__)
 
 
-def terminate_self():
-    pod_id = os.environ.get("RUNPOD_POD_ID")
-    api_key = os.environ.get("RUNPOD_API_KEY")
+def _say(message):
+    sys.stderr.write(f"terminate_self {message}\n")
+    sys.stderr.flush()
+
+
+def terminate_self(attempts=3):
+    """Delete this pod through the RunPod API so billing stops.
+
+    Returns True once RunPod accepted the request (or says the pod is already gone).
+    Every outcome is written to stderr so a permission problem is visible in the pod logs.
+    Falls back to stopping the pod if deleting keeps failing.
+    """
+    pod_id = os.environ.get("RUNPOD_POD_ID", "").strip()
+    api_key = os.environ.get("RUNPOD_API_KEY", "").strip()
     if not pod_id or not api_key:
-        return
-    base = os.environ.get("RUNPOD_API_BASE", "https://rest.runpod.io/v1")
+        _say("skipped: RUNPOD_POD_ID or RUNPOD_API_KEY is not set")
+        return False
+    base = os.environ.get("RUNPOD_API_BASE", "https://rest.runpod.io/v1").rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    for attempt in range(attempts):
+        try:
+            response = requests.delete(f"{base}/pods/{pod_id}", headers=headers, timeout=15)
+            if response.status_code < 300 or response.status_code == 404:
+                _say(f"ok delete http_{response.status_code}")
+                return True
+            _say(f"delete failed http_{response.status_code} {response.text[:200]}")
+        except Exception as exc:
+            _say(f"delete error {type(exc).__name__}")
+        if attempt < attempts - 1:
+            time.sleep(2 ** attempt)
     try:
-        requests.delete(
-            f"{base}/pods/{pod_id}",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15,
-        )
+        response = requests.post(f"{base}/pods/{pod_id}/stop", headers=headers, timeout=15)
+        _say(f"fallback stop http_{response.status_code} {response.text[:200]}")
+        return response.status_code < 300
     except Exception as exc:
-        log.error("terminate_self_failed %s", type(exc).__name__)
+        _say(f"fallback stop error {type(exc).__name__}")
+        return False

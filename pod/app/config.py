@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 def _raw(name):
@@ -45,6 +45,7 @@ class Settings:
     gpu_total_mb: int
     max_model_len: int
     kv_cache_dtype: str
+    quantization: str
     model_dir: str
     snac_dir: str
     logits_mask: str
@@ -52,6 +53,7 @@ class Settings:
     top_p: float
     top_k: int
     repetition_penalty: float
+    use_seeds: bool
     base_seed: int
     opus_bitrate: str
     opus_sample_rate: int
@@ -81,7 +83,8 @@ class Settings:
     decode_flush_seconds: float
     beat_seconds: int
     progress_every_items: int
-    progress_every_seconds: int
+    progress_every_seconds: float
+    stop_grace_seconds: float
     max_items: int
     max_text_chars: int
     max_retries: int
@@ -91,6 +94,7 @@ class Settings:
     min_max_tokens: int
     max_max_tokens: int
     tokens_per_char: float
+    min_tokens_per_char: float
     startup_margin_seconds: int
     opus_size_low: float
     opus_size_high: float
@@ -116,6 +120,9 @@ def load():
         gpu_total_mb=_int("GPU_TOTAL_MB", 24564),
         max_model_len=_int("MAX_MODEL_LEN", 2700),
         kv_cache_dtype=_str("KV_CACHE_DTYPE", "fp8"),
+        # "" = auto: follow the checkpoint's own quantization_config, else use fp8.
+        # "auto" = never pass a quantization argument. Anything else is passed as is.
+        quantization=_str("QUANTIZATION", ""),
         model_dir=_str("MODEL_DIR", "/opt/models/svara-fp8"),
         snac_dir=_str("SNAC_DIR", "/opt/models/snac_24khz"),
         logits_mask=_str("LOGITS_MASK", "range"),
@@ -123,6 +130,8 @@ def load():
         top_p=_float("TOP_P", 0.92),
         top_k=_int("TOP_K", 50),
         repetition_penalty=_float("REPETITION_PENALTY", 1.0),
+        # Per-request seeds force slower per-sequence sampling in vLLM 0.6.x. Off by default.
+        use_seeds=_bool("USE_SEEDS", False),
         base_seed=_int("BASE_SEED", 1234),
         opus_bitrate=_str("OPUS_BITRATE", "24k"),
         opus_sample_rate=_int("OPUS_SAMPLE_RATE", 16000),
@@ -151,10 +160,13 @@ def load():
         decode_microbatch=_int("DECODE_MICROBATCH", 8),
         decode_flush_seconds=_float("DECODE_FLUSH_SECONDS", 0.25),
         beat_seconds=_int("BEAT_SECONDS", 30),
-        progress_every_items=_int("PROGRESS_EVERY_ITEMS", 50),
-        progress_every_seconds=_int("PROGRESS_EVERY_SECONDS", 30),
+        # Results go to the server from a background thread in small batches.
+        # Set PROGRESS_EVERY_ITEMS=1 to write back clip by clip.
+        progress_every_items=_int("PROGRESS_EVERY_ITEMS", 5),
+        progress_every_seconds=_float("PROGRESS_EVERY_SECONDS", 5.0),
+        stop_grace_seconds=_float("STOP_GRACE_SECONDS", 20.0),
         max_items=_int("MAX_ITEMS", 5000),
-        max_text_chars=_int("MAX_TEXT_CHARS", 600),
+        max_text_chars=_int("MAX_TEXT_CHARS", 300),
         max_retries=_int("MAX_RETRIES", 2),
         queue_depth=_int("QUEUE_DEPTH", 64),
         slot_timeout_seconds=_float("SLOT_TIMEOUT_SECONDS", 120.0),
@@ -162,6 +174,7 @@ def load():
         min_max_tokens=_int("MIN_MAX_TOKENS", 400),
         max_max_tokens=_int("MAX_MAX_TOKENS", 2400),
         tokens_per_char=_float("TOKENS_PER_CHAR", 9.0),
+        min_tokens_per_char=_float("MIN_TOKENS_PER_CHAR", 7.0),
         startup_margin_seconds=_int("STARTUP_MARGIN_SECONDS", 600),
         opus_size_low=_float("OPUS_SIZE_LOW", 0.6),
         opus_size_high=_float("OPUS_SIZE_HIGH", 1.6),

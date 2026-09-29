@@ -1,4 +1,7 @@
 import asyncio
+import json
+import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -24,6 +27,23 @@ class WarmupItem:
     id: str
 
 
+def resolve_quantization(model_dir, override):
+    """Choose the value for vLLM's quantization argument.
+
+    llm-compressor checkpoints declare their own method in config.json, and vLLM 0.6.x
+    raises at startup if the argument disagrees with it. So pass nothing when the
+    checkpoint already declares one, and "fp8" only when it does not.
+    """
+    if override:
+        return None if override == "auto" else override
+    try:
+        with open(os.path.join(model_dir, "config.json")) as handle:
+            config = json.load(handle)
+    except Exception:
+        return "fp8"
+    return None if config.get("quantization_config") else "fp8"
+
+
 class Engine:
     def __init__(self, settings):
         self.settings = settings
@@ -43,7 +63,7 @@ class Engine:
             model=s.model_dir,
             tokenizer=s.model_dir,
             dtype="bfloat16",
-            quantization="fp8",
+            quantization=resolve_quantization(s.model_dir, s.quantization),
             kv_cache_dtype=s.kv_cache_dtype,
             max_model_len=s.max_model_len,
             max_num_seqs=s.max_num_seqs,
@@ -69,7 +89,7 @@ class Engine:
             repetition_penalty=s.repetition_penalty,
             max_tokens=prepared.max_tokens,
             stop_token_ids=[EOS],
-            seed=prepared.seed,
+            seed=prepared.seed if s.use_seeds else None,
             **sampling_restrictions(s.logits_mask),
         )
 
@@ -102,15 +122,22 @@ class Engine:
         return Finished(key=key, tokens=list(out.token_ids), finish_reason=out.finish_reason)
 
     async def generate(self, prepared_list, stop_flag):
+        """Yield Finished results. After stop_flag() turns true, no new requests are started
+        and in-flight ones get stop_grace_seconds to finish before being cancelled."""
         if self.llm is None:
             raise FatalEngineError("engine_not_started")
         limit = max(1, self.settings.max_num_seqs * 2)
+        grace = getattr(self.settings, "stop_grace_seconds", 20.0)
         iterator = iter(prepared_list)
         in_flight = set()
         exhausted = False
+        stopped_at = None
         try:
             while True:
-                while not exhausted and not stop_flag() and len(in_flight) < limit:
+                stopping = stop_flag()
+                if stopping and stopped_at is None:
+                    stopped_at = time.time()
+                while not exhausted and not stopping and len(in_flight) < limit:
                     try:
                         prepared = next(iterator)
                     except StopIteration:
@@ -118,9 +145,11 @@ class Engine:
                         break
                     in_flight.add(asyncio.create_task(self.run_one(prepared)))
                 if not in_flight:
-                    if exhausted or stop_flag():
+                    if exhausted or stopping:
                         return
                     continue
+                if stopped_at is not None and time.time() - stopped_at > grace:
+                    return
                 done, in_flight = await asyncio.wait(
                     in_flight, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
                 )
