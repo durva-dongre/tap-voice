@@ -58,8 +58,8 @@ env:
   DEFAULT_VLLM_VERSION: ${{ vars.DEFAULT_VLLM_VERSION }}
   DEFAULT_PREQUANTIZED_REVISION: ${{ vars.PREQUANTIZED_REVISION }}
   PREQUANTIZED_REPO: ${{ vars.PREQUANTIZED_REPO }}
-  IMAGE_REPO_NAME: ${{ vars.IMAGE_REPO_NAME }}
   DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+  IMAGE_REPO: ${{ vars.DOCKERHUB_NAMESPACE }}/${{ vars.IMAGE_REPO_NAME || 'svara-tts-pod' }}
   FALLBACK_VLLM_VERSION: 0.6.3.post1
 
 jobs:
@@ -104,7 +104,6 @@ jobs:
     timeout-minutes: 120
     outputs:
       immutable_tag: ${{ steps.resolve.outputs.immutable_tag }}
-      image_repo: ${{ steps.resolve.outputs.image_repo }}
       digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Free disk space
@@ -139,7 +138,6 @@ jobs:
           snac="${IN_SNAC:-${DEFAULT_SNAC_REVISION:-main}}"
           vllm="${IN_VLLM:-${DEFAULT_VLLM_VERSION:-$FALLBACK_VLLM_VERSION}}"
           preq_rev="${IN_PREQ_REV:-${DEFAULT_PREQUANTIZED_REVISION:-main}}"
-          repo_name="${IMAGE_REPO_NAME:-svara-tts-pod}"
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$IN_CACHE" = "false" ]; then
             push_cache="false"
           else
@@ -163,7 +161,6 @@ jobs:
             echo "vllm_version=$vllm"
             echo "preq_revision=$preq_rev"
             echo "push_cache=$push_cache"
-            echo "image_repo=${DOCKERHUB_NAMESPACE}/${repo_name}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -193,15 +190,15 @@ jobs:
             PREQUANTIZED_REPO=${{ env.PREQUANTIZED_REPO }}
             PREQUANTIZED_REVISION=${{ steps.resolve.outputs.preq_revision }}
           tags: |
-            ${{ steps.resolve.outputs.image_repo }}:${{ steps.resolve.outputs.immutable_tag }}
-          cache-from: type=registry,ref=${{ steps.resolve.outputs.image_repo }}:buildcache
-          cache-to: ${{ steps.resolve.outputs.push_cache == 'true' && format('type=registry,ref={0}:buildcache,mode=max', steps.resolve.outputs.image_repo) || '' }}
+            ${{ env.IMAGE_REPO }}:${{ steps.resolve.outputs.immutable_tag }}
+          cache-from: type=registry,ref=${{ env.IMAGE_REPO }}:buildcache
+          cache-to: ${{ steps.resolve.outputs.push_cache == 'true' && format('type=registry,ref={0}:buildcache,mode=max', env.IMAGE_REPO) || '' }}
 
       - name: Measure pushed image size
         id: size
         continue-on-error: true
         env:
-          REF: ${{ steps.resolve.outputs.image_repo }}:${{ steps.resolve.outputs.immutable_tag }}
+          REF: ${{ env.IMAGE_REPO }}:${{ steps.resolve.outputs.immutable_tag }}
         run: |
           set -euo pipefail
           docker buildx imagetools inspect "$REF" --raw > manifest.json
@@ -211,7 +208,7 @@ jobs:
       - name: Write build summary
         if: always()
         env:
-          REPO: ${{ steps.resolve.outputs.image_repo }}
+          REPO: ${{ env.IMAGE_REPO }}
           TAG: ${{ steps.resolve.outputs.immutable_tag }}
           SVARA: ${{ steps.resolve.outputs.svara_revision }}
           SNAC: ${{ steps.resolve.outputs.snac_revision }}
@@ -263,7 +260,7 @@ jobs:
       - name: Scan image
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ needs.build-and-push.outputs.image_repo }}:${{ needs.build-and-push.outputs.immutable_tag }}
+          image-ref: ${{ env.IMAGE_REPO }}:${{ needs.build-and-push.outputs.immutable_tag }}
           format: table
           severity: CRITICAL
           ignore-unfixed: true
@@ -277,7 +274,7 @@ jobs:
       - name: Write scan summary
         if: always()
         env:
-          REF: ${{ needs.build-and-push.outputs.image_repo }}:${{ needs.build-and-push.outputs.immutable_tag }}
+          REF: ${{ env.IMAGE_REPO }}:${{ needs.build-and-push.outputs.immutable_tag }}
           RESULT: ${{ job.status }}
         run: |
           {
@@ -303,7 +300,7 @@ jobs:
 
       - name: Move stable tag
         env:
-          REPO: ${{ needs.build-and-push.outputs.image_repo }}
+          REPO: ${{ env.IMAGE_REPO }}
           TAG: ${{ needs.build-and-push.outputs.immutable_tag }}
         run: |
           set -euo pipefail
