@@ -24,7 +24,8 @@ ARG VLLM_VERSION
 ENV HF_HOME=/opt/hf HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     MODELS_DIR=/opt/models MODEL_DIR=/opt/models/svara-fp8 SNAC_DIR=/opt/models/snac_24khz \
     HOME=/home/runner
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg linux-libc-dev \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 10001 -m runner \
     && mkdir -p /opt/hf && chown 10001:10001 /opt/hf
