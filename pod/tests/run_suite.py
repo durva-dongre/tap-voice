@@ -19,7 +19,6 @@ STAGE_ORDER = ("selftest", "bench", "e2e")
 LOG_LIMIT = 3000
 UPLOAD_LOG_LINES = 1500
 MAX_FAIL_RATE = 0.02
-# The first batch of results the server sees must be a small part of the run.
 MAX_FIRST_BATCH_SHARE = 0.25
 
 BENCH_KEYS = (
@@ -89,6 +88,10 @@ def env_flag(name, default):
     if not value:
         return default
     return value.lower() in ("1", "true", "yes", "on")
+
+
+def local_storage():
+    return env_str("STORAGE_BACKEND", "gcs").lower() == "local"
 
 
 def gpu_info():
@@ -277,7 +280,6 @@ def check_urls(samples):
 
 
 def progress_is_incremental(incremental, total):
-    """True when results reached the server while the run was going, not all at the end."""
     if total < 20:
         return True
     if incremental.get("progress_calls", 0) < 3:
@@ -286,11 +288,6 @@ def progress_is_incremental(incremental, total):
 
 
 def project_daily_cost(stats, rate, clips_per_batch, batches_per_day):
-    """Fixed startup plus marginal per-clip time, scaled to a real batch.
-
-    Not included: pod scheduling and image pull time before the container starts. Add the
-    'Uptime' RunPod shows for a pod minus the elapsed_seconds in this report to estimate it.
-    """
     startup = stats.get("startup_seconds")
     per_clip = stats.get("marginal_seconds_per_clip")
     if startup is None or per_clip is None:
@@ -341,7 +338,6 @@ def stage_e2e(timeout, run_id, rate):
                 "MODEL_REVISION": f"{env_str('MODEL_REVISION', 'test')}-{run_id}",
                 "GCS_PREFIX": env_str("TEST_GCS_PREFIX", "test-e2e"),
                 "GPU_HOURLY_RATE": str(rate),
-                # The parent stops the pod; the child must not.
                 "RUNPOD_API_KEY": "",
             }
         )
@@ -387,6 +383,7 @@ def stage_e2e(timeout, run_id, rate):
         "progress_incremental": incremental_ok,
         "cost_projection": projection,
         "gcs_prefix": env["GCS_PREFIX"],
+        "storage_backend": env_str("STORAGE_BACKEND", "gcs"),
         "sample_urls": report["sample_urls"],
         "url_checks": checks,
     }
@@ -394,7 +391,7 @@ def stage_e2e(timeout, run_id, rate):
     note = ""
     if not ok:
         if not urls_ok:
-            note = "uploaded files are not publicly readable as audio/ogg"
+            note = "uploaded files are not readable as audio/ogg"
         elif not incremental_ok:
             note = "results reached the server in one lump at the end instead of as clips finished"
         elif fail_rate > MAX_FAIL_RATE:
@@ -469,6 +466,10 @@ def main():
     stages = [name for name in STAGE_ORDER if name in requested]
     deadline = started + env_int("TEST_TIMEOUT_MINUTES", 90) * 60
     rate = env_float("GPU_HOURLY_RATE", 0.34)
+    if local_storage():
+        from app.storage import serve_local
+
+        serve_local(env_str("LOCAL_STORAGE_DIR", "/tmp/clips"), env_int("LOCAL_STORAGE_PORT", 8081))
     results = []
     logs = []
     for name in stages:
@@ -496,6 +497,7 @@ def main():
     report = {
         "run_id": run_id,
         "mode": "test",
+        "storage_backend": env_str("STORAGE_BACKEND", "gcs"),
         "verdict": "pass" if passed else "fail",
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "total_seconds": round(time.time() - started, 1),
@@ -514,6 +516,11 @@ def main():
         sys.stdout.write(describe(record) + "\n")
     sys.stdout.write(f"verdict: {report['verdict']}\n")
     sys.stdout.flush()
+    if local_storage():
+        sys.stdout.write("=== REPORT JSON BEGIN ===\n")
+        sys.stdout.write(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+        sys.stdout.write("=== REPORT JSON END ===\n")
+        sys.stdout.flush()
     try:
         urls = publish(run_id, report, log_text)
     except Exception as exc:

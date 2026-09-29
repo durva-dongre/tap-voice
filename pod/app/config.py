@@ -34,6 +34,10 @@ def _bool(name, default):
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _need(name, local, default):
+    return _str(name, default) if local else _req(name)
+
+
 @dataclass(frozen=True)
 class Settings:
     selftest: bool
@@ -98,6 +102,9 @@ class Settings:
     startup_margin_seconds: int
     opus_size_low: float
     opus_size_high: float
+    storage_backend: str
+    local_dir: str
+    local_port: int
 
 
 def load():
@@ -110,6 +117,10 @@ def load():
         run_id = _req("RUN_ID")
         run_token = _req("RUN_TOKEN")
         server_url = _req("SERVER_URL").rstrip("/")
+    backend = _str("STORAGE_BACKEND", "gcs").lower()
+    if backend not in ("gcs", "local"):
+        raise RuntimeError(f"unsupported STORAGE_BACKEND {backend}")
+    local = backend == "local"
     return Settings(
         selftest=selftest,
         run_id=run_id,
@@ -120,8 +131,6 @@ def load():
         gpu_total_mb=_int("GPU_TOTAL_MB", 24564),
         max_model_len=_int("MAX_MODEL_LEN", 2700),
         kv_cache_dtype=_str("KV_CACHE_DTYPE", "fp8"),
-        # "" = auto: follow the checkpoint's own quantization_config, else use fp8.
-        # "auto" = never pass a quantization argument. Anything else is passed as is.
         quantization=_str("QUANTIZATION", ""),
         model_dir=_str("MODEL_DIR", "/opt/models/svara-fp8"),
         snac_dir=_str("SNAC_DIR", "/opt/models/snac_24khz"),
@@ -130,7 +139,6 @@ def load():
         top_p=_float("TOP_P", 0.92),
         top_k=_int("TOP_K", 50),
         repetition_penalty=_float("REPETITION_PENALTY", 1.0),
-        # Per-request seeds force slower per-sequence sampling in vLLM 0.6.x. Off by default.
         use_seeds=_bool("USE_SEEDS", False),
         base_seed=_int("BASE_SEED", 1234),
         opus_bitrate=_str("OPUS_BITRATE", "24k"),
@@ -144,11 +152,11 @@ def load():
         max_duration=_float("MAX_DURATION", 45.0),
         loudness_normalize=_bool("LOUDNESS_NORMALIZE", True),
         loudness_target_db=_float("LOUDNESS_TARGET_DB", -20.0),
-        gcs_bucket=_req("GCS_BUCKET"),
+        gcs_bucket=_need("GCS_BUCKET", local, "local"),
         gcs_prefix=_str("GCS_PREFIX", "tts"),
-        gcs_credentials_b64=_req("GCS_SERVICE_ACCOUNT_JSON_B64"),
-        cdn_base_url=_req("CDN_BASE_URL").rstrip("/"),
-        model_revision=_req("MODEL_REVISION"),
+        gcs_credentials_b64=_need("GCS_SERVICE_ACCOUNT_JSON_B64", local, ""),
+        cdn_base_url=_need("CDN_BASE_URL", local, "").rstrip("/"),
+        model_revision=_need("MODEL_REVISION", local, "local"),
         pod_limit_seconds=_int("POD_LIMIT_SECONDS", 7200),
         seconds_per_item_cap=_float("SECONDS_PER_ITEM_CAP", 3.0),
         startup_timeout_seconds=_int("STARTUP_TIMEOUT_SECONDS", 600),
@@ -160,8 +168,6 @@ def load():
         decode_microbatch=_int("DECODE_MICROBATCH", 8),
         decode_flush_seconds=_float("DECODE_FLUSH_SECONDS", 0.25),
         beat_seconds=_int("BEAT_SECONDS", 30),
-        # Results go to the server from a background thread in small batches.
-        # Set PROGRESS_EVERY_ITEMS=1 to write back clip by clip.
         progress_every_items=_int("PROGRESS_EVERY_ITEMS", 5),
         progress_every_seconds=_float("PROGRESS_EVERY_SECONDS", 5.0),
         stop_grace_seconds=_float("STOP_GRACE_SECONDS", 20.0),
@@ -178,6 +184,9 @@ def load():
         startup_margin_seconds=_int("STARTUP_MARGIN_SECONDS", 600),
         opus_size_low=_float("OPUS_SIZE_LOW", 0.6),
         opus_size_high=_float("OPUS_SIZE_HIGH", 1.6),
+        storage_backend=backend,
+        local_dir=_str("LOCAL_STORAGE_DIR", "/tmp/clips"),
+        local_port=_int("LOCAL_STORAGE_PORT", 8081),
     )
 
 
