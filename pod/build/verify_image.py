@@ -87,6 +87,20 @@ def imports_ok():
     return "vllm " + importlib.metadata.version("vllm")
 
 
+def vllm_registry():
+    from vllm.model_executor.models import ModelRegistry
+
+    ModelRegistry.is_multimodal_model(["LlamaForCausalLM"])
+    return "LlamaForCausalLM inspected"
+
+
+def mkl_threading():
+    value = os.environ.get("MKL_THREADING_LAYER", "")
+    if value.upper() != "GNU":
+        raise RuntimeError(f"MKL_THREADING_LAYER is '{value}', expected GNU")
+    return value
+
+
 def app_modules():
     for name in ("app.audio", "app.codec", "app.config", "app.engine", "app.pipeline", "app.prompt"):
         importlib.import_module(name)
@@ -148,7 +162,9 @@ for label, fn in (
     ("model files", model_files),
     ("snac files", snac_files),
     ("tokenizer", tokenizer_ok),
+    ("mkl threading layer", mkl_threading),
     ("imports", imports_ok),
+    ("vllm model registry", vllm_registry),
     ("app modules", app_modules),
     ("gcc", gcc_present),
     ("ffmpeg binary", ffmpeg_path),

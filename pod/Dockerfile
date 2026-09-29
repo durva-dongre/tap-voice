@@ -24,7 +24,8 @@ FROM base AS runtime
 ARG VLLM_VERSION
 ENV HF_HOME=/opt/hf HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
     MODELS_DIR=/opt/models MODEL_DIR=/opt/models/svara-fp8 SNAC_DIR=/opt/models/snac_24khz \
-    HOME=/home/runner FFMPEG_BIN=/usr/bin/ffmpeg
+    HOME=/home/runner FFMPEG_BIN=/usr/bin/ffmpeg \
+    MKL_THREADING_LAYER=GNU
 RUN test -n "${VLLM_VERSION}"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev linux-libc-dev \
