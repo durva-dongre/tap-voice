@@ -12,8 +12,6 @@ from .prompt import fits_context, prepare, sort_by_length
 
 log = logging.getLogger("pipeline")
 
-# Problems with one clip's content. They cost a retry but say nothing about the machine, so
-# they never trip the consecutive-failure breaker (longest-first ordering front-loads them).
 CONTENT_REASONS = frozenset(
     {
         "empty",
@@ -30,19 +28,10 @@ CONTENT_REASONS = frozenset(
     }
 )
 
-# On the first pass a cut-off clip is expected: the token cap is an estimate and the retry
-# exists for exactly this. It is counted in telemetry but not held against the run.
-SOFT_FIRST_PASS = frozenset({"truncated"})
+PRUNE_AT = 1024
 
 
 class Pipeline:
-    """Generate -> decode -> encode -> upload, with results reported clip by clip.
-
-    Bookkeeping happens in the upload thread the moment a clip is safely stored, so
-    progress, the idle watchdog and the heartbeat all move while the batch is running.
-    A background thread sends the records to the server in small batches.
-    """
-
     def __init__(self, settings, engine, codec, store, control, telemetry, heartbeat):
         self.s = settings
         self.engine = engine
@@ -52,7 +41,11 @@ class Pipeline:
         self.tel = telemetry
         self.hb = heartbeat
         self.pool = ThreadPoolExecutor(max_workers=settings.upload_threads)
-        self.slots = threading.BoundedSemaphore(settings.queue_depth)
+        self.decoder_pool = ThreadPoolExecutor(max_workers=1)
+        self.loop = None
+        self.slots = None
+        self.futures = []
+        self.futures_lock = threading.Lock()
         self.records = []
         self.records_lock = threading.Lock()
         self.send_lock = threading.Lock()
@@ -61,15 +54,13 @@ class Pipeline:
         self.finished_ids = set()
         self.finished_lock = threading.Lock()
         self.total = 0
+        self.final_failed = 0
         self.state_lock = threading.RLock()
         self.last_progress = time.time()
         self.consecutive_failures = 0
         self.window = collections.deque(maxlen=max(10, settings.breaker_window))
-        self.attempt = 0
         self.tripped = None
         self.last_reason = {}
-
-    # ---- bookkeeping -------------------------------------------------------------
 
     def remaining(self):
         with self.finished_lock:
@@ -89,6 +80,10 @@ class Pipeline:
         }
         with self.records_lock:
             self.records.append(record)
+
+    def _touch(self):
+        with self.state_lock:
+            self.last_progress = time.time()
 
     def _success(self):
         with self.state_lock:
@@ -114,7 +109,7 @@ class Pipeline:
         self.tel.fail(reason)
         with self.state_lock:
             self.last_reason[item.id] = reason
-            if not count or (reason in SOFT_FIRST_PASS and self.attempt == 0):
+            if not count:
                 return
             self.window.append(False)
             if reason not in CONTENT_REASONS:
@@ -122,6 +117,18 @@ class Pipeline:
                 if self.consecutive_failures >= self.s.max_consecutive_failures:
                     self._trip("consecutive_failures")
             self._check_window()
+
+    def _fail_final(self, item, reason, count=True):
+        self.tel.fail(reason)
+        self.tel.add("failed")
+        self._record(item, "failed", error=reason)
+        self._mark_finished(item.id)
+        with self.state_lock:
+            self.final_failed += 1
+            self.last_reason[item.id] = reason
+            if count:
+                self.window.append(False)
+                self._check_window()
 
     def _guards(self):
         with self.state_lock:
@@ -131,10 +138,7 @@ class Pipeline:
         if self.tel.spend(self.s.gpu_hourly_rate) > self.s.max_spend_usd:
             self._trip("spend_cap")
 
-    # ---- progress reporting ------------------------------------------------------
-
     def _flush(self, force=False):
-        """Send pending records. Returns True when nothing is left pending."""
         with self.send_lock:
             with self.records_lock:
                 if not self.records:
@@ -175,8 +179,6 @@ class Pipeline:
             self.hb.set("generating", self.remaining())
             self._guards()
 
-    # ---- work --------------------------------------------------------------------
-
     def _plan(self, items):
         pending = []
         for item in items:
@@ -189,6 +191,12 @@ class Pipeline:
                 pending.append(item)
         self.tel.add("planned", len(pending))
         return pending
+
+    def _release_slot(self):
+        try:
+            self.loop.call_soon_threadsafe(self.slots.release)
+        except RuntimeError:
+            pass
 
     def _encode_upload(self, item, wave):
         try:
@@ -210,87 +218,120 @@ class Pipeline:
         except Exception as exc:
             self._add_failure(item, type(exc).__name__)
         finally:
-            self.slots.release()
+            self._release_slot()
 
-    async def _submit(self, loop, futures, item, wave):
-        if not self.slots.acquire(blocking=False):
-            acquired = await loop.run_in_executor(
-                None, lambda: self.slots.acquire(timeout=self.s.slot_timeout_seconds)
-            )
-            if not acquired:
-                return False
+    async def _submit(self, item, wave):
         try:
-            futures.append(self.pool.submit(self._encode_upload, item, wave))
+            await asyncio.wait_for(self.slots.acquire(), timeout=self.s.slot_timeout_seconds)
+        except asyncio.TimeoutError:
+            return False
+        try:
+            future = self.pool.submit(self._encode_upload, item, wave)
         except Exception:
             self.slots.release()
             raise
+        with self.futures_lock:
+            if len(self.futures) >= PRUNE_AT:
+                self.futures = [f for f in self.futures if not f.done()]
+            self.futures.append(future)
         return True
 
-    @staticmethod
-    def _wait(futures):
-        for future in futures:
+    def _wait_encodes(self):
+        with self.futures_lock:
+            pending = list(self.futures)
+            self.futures = []
+        for future in pending:
             try:
                 future.result()
             except Exception:
                 pass
 
-    async def _generate_decode(self, prepared, futures):
-        loop = asyncio.get_running_loop()
-        by_id = {p.item.id: p.item for p in prepared}
-        buffer = []
-        last_drain = time.time()
+    async def _decode_and_submit(self, batch, by_id):
+        entries = [(f.key, f.tokens) for f in batch]
+        try:
+            decoded, bad = await self.loop.run_in_executor(
+                self.decoder_pool, self.codec.decode_batch, entries
+            )
+        except Exception as exc:
+            for f in batch:
+                self._add_failure(by_id[f.key], type(exc).__name__)
+            return
+        for key, reason in bad:
+            self._add_failure(by_id[key], reason)
+        for key, wave in decoded:
+            self.tel.add("decoded")
+            if not await self._submit(by_id[key], wave):
+                self._add_failure(by_id[key], "slot_timeout")
 
-        async def drain():
-            nonlocal buffer, last_drain
-            if not buffer:
+    async def _decoder(self, queue, by_id):
+        loop = self.loop
+        micro = max(1, self.s.decode_microbatch)
+        while True:
+            first = await queue.get()
+            if first is None:
                 return
-            entries = [(f.key, f.tokens) for f in buffer]
-            buffer = []
-            last_drain = time.time()
-            decoded, bad = await loop.run_in_executor(None, self.codec.decode_batch, entries)
-            for key, reason in bad:
-                self._add_failure(by_id[key], reason)
-            for key, wave in decoded:
-                self.tel.add("decoded")
-                if not await self._submit(loop, futures, by_id[key], wave):
-                    self._add_failure(by_id[key], "slot_timeout")
+            batch = [first]
+            closed = False
+            deadline = loop.time() + self.s.decode_flush_seconds
+            while len(batch) < micro and not closed:
+                try:
+                    nxt = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    wait = deadline - loop.time()
+                    if wait <= 0:
+                        break
+                    try:
+                        nxt = await asyncio.wait_for(queue.get(), wait)
+                    except asyncio.TimeoutError:
+                        break
+                if nxt is None:
+                    closed = True
+                else:
+                    batch.append(nxt)
+            await self._decode_and_submit(batch, by_id)
+            if closed:
+                return
 
-        async for finished in self.engine.generate(prepared, stop_event.is_set):
-            self.tel.add("generated")
-            if finished.error:
-                self._add_failure(by_id[finished.key], finished.error)
-            elif finished.finish_reason == "length":
-                # Ran out of tokens before the model said it was done: the audio is cut off.
-                self.tel.add("truncated")
-                self._add_failure(by_id[finished.key], "truncated")
-            else:
-                self.tel.add("tokens", len(finished.tokens))
-                buffer.append(finished)
-            if (
-                len(buffer) >= self.s.decode_microbatch
-                or time.time() - last_drain >= self.s.decode_flush_seconds
-            ):
-                await drain()
-        await drain()
+    async def _stream(self, prepared):
+        if not prepared:
+            return
+        by_id = {p.item.id: p.item for p in prepared}
+        queue = asyncio.Queue()
+        decoder = asyncio.create_task(self._decoder(queue, by_id))
+        try:
+            async for finished in self.engine.generate(prepared, stop_event.is_set):
+                self.tel.add("generated", finished.generations)
+                self.tel.add("tokens", finished.spent_tokens)
+                if finished.truncations:
+                    self.tel.add("truncated", finished.truncations)
+                if finished.generations > 1:
+                    self.tel.add("retried", finished.generations - 1)
+                self._touch()
+                item = by_id[finished.key]
+                if finished.error:
+                    self._add_failure(item, finished.error)
+                elif finished.finish_reason == "length":
+                    self._fail_final(item, "truncated")
+                else:
+                    queue.put_nowait(finished)
+        finally:
+            queue.put_nowait(None)
+            await asyncio.gather(decoder, return_exceptions=True)
 
     def _reject_oversize(self, prepared):
-        """Items whose prompt leaves too little context for the audio: fail them for good."""
         keep = []
         for entry in prepared:
             if fits_context(entry, self.s):
                 keep.append(entry)
                 continue
-            self.tel.fail("prompt_too_long")
-            self.tel.add("failed")
-            self._record(entry.item, "failed", error="prompt_too_long")
-            self._mark_finished(entry.item.id)
+            self._fail_final(entry.item, "prompt_too_long", count=False)
         return keep
 
     async def run(self, items):
-        loop = asyncio.get_running_loop()
+        self.loop = asyncio.get_running_loop()
+        self.slots = asyncio.Semaphore(max(1, self.s.queue_depth))
         self.total = len(items)
         current = []
-        leftover = []
         flusher = threading.Thread(target=self._flush_loop, daemon=True)
         flusher.start()
         monitor = asyncio.create_task(self._monitor())
@@ -300,18 +341,15 @@ class Pipeline:
             while current and attempt <= self.s.max_retries:
                 if stop_event.is_set():
                     break
-                with self.state_lock:
-                    self.attempt = attempt
-                    self.last_progress = time.time()
+                self._touch()
                 if attempt > 0:
                     self.tel.add("retried", len(current))
                 prepared = prepare(current, self.engine.tokenizer, self.s, attempt=attempt)
                 prepared = sort_by_length(self._reject_oversize(prepared))
-                futures = []
                 try:
-                    await self._generate_decode(prepared, futures)
+                    await self._stream(prepared)
                 finally:
-                    await loop.run_in_executor(None, self._wait, futures)
+                    await self.loop.run_in_executor(None, self._wait_encodes)
                 with self.finished_lock:
                     done = set(self.finished_ids)
                 current = [item for item in current if item.id not in done]
@@ -321,6 +359,7 @@ class Pipeline:
             with contextlib.suppress(asyncio.CancelledError):
                 await monitor
             self.pool.shutdown(wait=True, cancel_futures=True)
+            self.decoder_pool.shutdown(wait=False)
             self.flush_stop.set()
             with self.finished_lock:
                 done = set(self.finished_ids)
@@ -335,4 +374,4 @@ class Pipeline:
             for _ in range(2):
                 if self._flush(force=True) or stop_event.is_set():
                     break
-        return len(leftover), self.tripped
+        return len(leftover) + self.final_failed, self.tripped

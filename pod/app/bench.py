@@ -179,23 +179,20 @@ async def run_single(settings, count):
         for key, wave in decoded:
             futures.append(pool.submit(encode_job, by_id[key], wave))
 
-    async def one_pass(batch, attempt):
-        """Same retry rule as production: a cut-off clip is generated again, and both
-        generations are billed. Returns the clips that were cut off."""
-        prepared = sort_by_length(prepare(batch, engine.tokenizer, settings, attempt=attempt))
+    async def one_pass(batch):
+        prepared = sort_by_length(prepare(batch, engine.tokenizer, settings, attempt=0))
         by_id = {p.item.id: p.item for p in prepared}
         buffer = []
         last = time.time()
-        cut_off = []
         async for finished in engine.generate(prepared, lambda: False):
+            totals["tokens"] += finished.spent_tokens
+            totals["truncated_first_pass"] += finished.truncations
+            totals["retried"] += finished.generations - 1
             if finished.error:
                 note(finished.error)
                 continue
-            totals["tokens"] += len(finished.tokens)
             if finished.finish_reason == "length":
-                if attempt == 0:
-                    totals["truncated_first_pass"] += 1
-                cut_off.append(by_id[finished.key])
+                note("truncated")
                 continue
             buffer.append(finished)
             if (
@@ -207,18 +204,9 @@ async def run_single(settings, count):
                 await drain(ready, by_id)
         if buffer:
             await drain(buffer, by_id)
-        return cut_off
 
     run_start = time.time()
-    pending = items
-    for attempt in range(settings.max_retries + 1):
-        if not pending:
-            break
-        if attempt > 0:
-            totals["retried"] += len(pending)
-        pending = await one_pass(pending, attempt)
-    for _ in pending:
-        note("truncated")
+    await one_pass(items)
     generate_wall = time.time() - run_start
 
     ok = 0

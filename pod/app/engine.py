@@ -4,11 +4,11 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
 from .logits import sampling_restrictions
-from .prompt import EOS, Prepared, bos_id, build_ids
+from .prompt import EOS, Prepared, attempt_cap, bos_id, build_ids, seed_from_hash
 
 log = logging.getLogger("engine")
 
@@ -23,6 +23,9 @@ class Finished:
     tokens: List[int] = field(default_factory=list)
     error: Optional[str] = None
     finish_reason: Optional[str] = None
+    generations: int = 1
+    truncations: int = 0
+    spent_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -31,12 +34,6 @@ class WarmupItem:
 
 
 def resolve_quantization(model_dir, override):
-    """Choose the value for vLLM's quantization argument.
-
-    llm-compressor checkpoints declare their own method in config.json, and vLLM 0.6.x
-    raises at startup if the argument disagrees with it. So pass nothing when the
-    checkpoint already declares one, and "fp8" only when it does not.
-    """
     if override:
         return None if override == "auto" else override
     try:
@@ -56,8 +53,6 @@ class Engine:
         self.extras = {}
         self._params_cls = None
 
-    # ---- configuration -----------------------------------------------------------
-
     def _gpu_total_mb(self):
         try:
             import torch
@@ -72,8 +67,6 @@ class Engine:
         return max(0.5, min(0.95, s.gpu_memory_utilization - reserve))
 
     def resolve_kv_dtype(self):
-        """FP8 KV cache needs CUDA arch 8.9+ (Ada/Hopper). On Ampere it crashes at the first
-        request inside a Triton kernel, after the model has already been paid for."""
         requested = (self.settings.kv_cache_dtype or "auto").strip().lower()
         if not requested.startswith("fp8"):
             return requested
@@ -89,7 +82,6 @@ class Engine:
         return requested
 
     def _probe_extras(self):
-        """Optional CPU savers. Each is used only if this vLLM build accepts it."""
         from vllm import SamplingParams
 
         s = self.settings
@@ -127,7 +119,6 @@ class Engine:
             max_num_seqs=s.max_num_seqs,
             gpu_memory_utilization=self.utilization(),
             enable_prefix_caching=s.enable_prefix_caching,
-            # Multi-step scheduling and chunked prefill do not combine in vLLM 0.6.x.
             enable_chunked_prefill=s.enable_chunked_prefill and steps == 1,
             swap_space=0,
             enforce_eager=False,
@@ -150,15 +141,14 @@ class Engine:
         )
         return self.tokenizer
 
-    # ---- generation --------------------------------------------------------------
-
     def sampling(self, prepared):
         s = self.settings
+        attempt = getattr(prepared, "attempt", 0)
         return self._params_cls(
-            temperature=s.temperature,
+            temperature=max(0.3, s.temperature - 0.08 * attempt),
             top_p=s.top_p,
             top_k=s.top_k,
-            repetition_penalty=s.repetition_penalty,
+            repetition_penalty=s.repetition_penalty + 0.03 * attempt,
             max_tokens=prepared.max_tokens,
             stop_token_ids=[EOS],
             seed=prepared.seed if s.use_seeds else None,
@@ -172,7 +162,7 @@ class Engine:
             return False
         return bool(errored() if callable(errored) else errored)
 
-    async def run_one(self, prepared):
+    async def _once(self, prepared):
         key = prepared.item.id
         request_id = f"{key}-{uuid.uuid4().hex[:8]}"
         last = None
@@ -192,52 +182,99 @@ class Engine:
         if last is None or not last.outputs:
             return Finished(key=key, error="no_output")
         out = last.outputs[0]
-        return Finished(key=key, tokens=list(out.token_ids), finish_reason=out.finish_reason)
+        tokens = list(out.token_ids)
+        return Finished(
+            key=key, tokens=tokens, finish_reason=out.finish_reason, spent_tokens=len(tokens)
+        )
+
+    def _retryable(self, prepared):
+        if getattr(prepared.item, "content_hash", None) is None:
+            return False
+        return prepared.attempt < self.settings.max_retries
+
+    def _next_attempt(self, prepared):
+        attempt = prepared.attempt + 1
+        item = prepared.item
+        return replace(
+            prepared,
+            max_tokens=attempt_cap(item.text, prepared.room, self.settings, attempt),
+            seed=seed_from_hash(item.content_hash, self.settings.base_seed, attempt),
+            attempt=attempt,
+        )
+
+    async def run_one(self, prepared, stop_flag=None):
+        current = prepared
+        generations = 0
+        truncations = 0
+        spent = 0
+        while True:
+            result = await self._once(current)
+            generations += 1
+            spent += len(result.tokens)
+            cut = result.error is None and result.finish_reason == "length"
+            if cut:
+                truncations += 1
+            stopping = stop_flag is not None and stop_flag()
+            if not cut or stopping or not self._retryable(current):
+                result.generations = generations
+                result.truncations = truncations
+                result.spent_tokens = spent
+                return result
+            current = self._next_attempt(current)
 
     async def generate(self, prepared_list, stop_flag):
-        """Yield Finished results. After stop_flag() turns true, no new requests are started
-        and in-flight ones get stop_grace_seconds to finish before being cancelled."""
         if self.llm is None:
             raise FatalEngineError("engine_not_started")
-        limit = max(1, self.settings.max_num_seqs * 2)
+        prepared_list = list(prepared_list)
+        if not prepared_list:
+            return
+        workers_count = max(1, min(self.settings.max_num_seqs * 2, len(prepared_list)))
         grace = getattr(self.settings, "stop_grace_seconds", 20.0)
-        iterator = iter(prepared_list)
-        in_flight = set()
-        exhausted = False
+        source = iter(prepared_list)
+        queue = asyncio.Queue()
+
+        async def worker():
+            try:
+                while not stop_flag():
+                    try:
+                        prepared = next(source)
+                    except StopIteration:
+                        return
+                    queue.put_nowait(await self.run_one(prepared, stop_flag))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                queue.put_nowait(exc)
+            finally:
+                queue.put_nowait(None)
+
+        workers = [asyncio.create_task(worker()) for _ in range(workers_count)]
+        alive = workers_count
         stopped_at = None
         try:
-            while True:
-                stopping = stop_flag()
-                if stopping and stopped_at is None:
+            while alive:
+                if stopped_at is None and stop_flag():
                     stopped_at = time.time()
-                while not exhausted and not stopping and len(in_flight) < limit:
-                    try:
-                        prepared = next(iterator)
-                    except StopIteration:
-                        exhausted = True
-                        break
-                    in_flight.add(asyncio.create_task(self.run_one(prepared)))
-                if not in_flight:
-                    if exhausted or stopping:
-                        return
-                    continue
                 if stopped_at is not None and time.time() - stopped_at > grace:
                     return
-                done, in_flight = await asyncio.wait(
-                    in_flight, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
-                )
-                if not done and self.is_dead():
-                    raise FatalEngineError("engine_dead")
-                for task in done:
-                    yield task.result()
+                try:
+                    got = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if self.is_dead():
+                        raise FatalEngineError("engine_dead")
+                    continue
+                if got is None:
+                    alive -= 1
+                    continue
+                if isinstance(got, BaseException):
+                    raise got
+                yield got
         finally:
-            for task in in_flight:
+            for task in workers:
                 task.cancel()
-            if in_flight:
-                await asyncio.gather(*in_flight, return_exceptions=True)
+            await asyncio.gather(*workers, return_exceptions=True)
 
     async def warmup(self, voices=None):
-        """One tiny request is enough to trigger kernel setup; more only add billed seconds."""
         chosen = list(voices or [])[: max(1, self.settings.warmup_voices)] or ["English (Female)"]
         bos = bos_id(self.tokenizer)
         prepared = []

@@ -4,44 +4,46 @@ from .prompt import AUDIO_END, AUDIO_OFFSET, EOS, HEADER_TOKENS
 
 FRAME = 7
 BAND = 4096
+HEADER_POSITIONS = 2
 
 _PROCESSOR_CACHE = {}
 
 
 class RangeMask:
-    """Allow audio tokens, EOS and (optionally) the two header tokens; forbid everything else.
-
-    Runs once per sequence per decode step inside vLLM, so it must be cheap: the mask is
-    built once per device/dtype and added in place (no new vocab-sized tensor per call).
-    """
-
     def __init__(self, allow_header=True):
         self.allow_header = allow_header
-        self.mask = None
+        self.base = None
+        self.head = None
 
-    def _get(self, logits):
-        mask = self.mask
-        if mask is None or mask.device != logits.device or mask.dtype != logits.dtype:
-            import torch
+    def _build(self, logits):
+        import torch
 
-            mask = torch.full(
-                (logits.shape[-1],), float("-inf"), device=logits.device, dtype=logits.dtype
-            )
-            mask[AUDIO_OFFSET:AUDIO_END] = 0.0
-            mask[EOS] = 0.0
-            if self.allow_header:
-                for token in HEADER_TOKENS:
-                    mask[token] = 0.0
-            self.mask = mask
-        return mask
+        base = torch.full(
+            (logits.shape[-1],), float("-inf"), device=logits.device, dtype=logits.dtype
+        )
+        base[AUDIO_OFFSET:AUDIO_END] = 0.0
+        base[EOS] = 0.0
+        head = base.clone()
+        for token in HEADER_TOKENS:
+            head[token] = 0.0
+        self.base = base
+        self.head = head
 
     def __call__(self, output_ids: List[int], logits):
-        return logits.add_(self._get(logits))
+        base = self.base
+        if (
+            base is None
+            or base.device != logits.device
+            or base.dtype != logits.dtype
+            or base.shape[-1] != logits.shape[-1]
+        ):
+            self._build(logits)
+        if self.allow_header and len(output_ids) < HEADER_POSITIONS:
+            return logits.add_(self.head)
+        return logits.add_(self.base)
 
 
 class FrameMask:
-    """Strict 7-slot mask. Does not allow header tokens, so use it only for models without them."""
-
     def __init__(self):
         self.masks = None
 

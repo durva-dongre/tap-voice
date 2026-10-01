@@ -83,40 +83,50 @@ def report_existing(control, store, items, telemetry):
     telemetry.add("skipped_existing", len(records))
 
 
-async def load_engine(settings, engine):
-    await engine.start()
-    return Codec(
-        settings.snac_dir, half=settings.snac_half, tolerance=settings.bad_code_tolerance
-    )
-
-
-async def body(settings, control, heartbeat, telemetry, deadline):
+def fetch_work(settings, control, heartbeat, telemetry):
     heartbeat.set("fetching_manifest", 0)
     payload = control.manifest()
     items, rejected = manifest_mod.parse(payload.get("items", []), settings)
     telemetry.add("rejected", len(rejected))
     report_rejected(control, rejected)
     if not items:
-        return "empty"
-
+        return [], [], None
     heartbeat.set("loading_storage", len(items))
     store = Store(settings)
     store.load_existing(sorted({item.language for item in items}))
     pending = [item for item in items if not store.exists(store.key_for(item))]
     if not pending:
         report_existing(control, store, items, telemetry)
-        return "completed"
+    return items, pending, store
 
-    heartbeat.set("loading_engine", len(pending))
+
+def load_codec(settings):
+    codec = Codec(
+        settings.snac_dir, half=settings.snac_half, tolerance=settings.bad_code_tolerance
+    )
+    codec.warmup()
+    return codec
+
+
+async def body(settings, control, heartbeat, telemetry, deadline):
+    loop = asyncio.get_running_loop()
     _PHASE.set("startup")
     signal.alarm(settings.startup_timeout_seconds + settings.startup_alarm_margin_seconds)
+    heartbeat.set("loading_engine", 0)
+    work_future = loop.run_in_executor(None, fetch_work, settings, control, heartbeat, telemetry)
     engine = Engine(settings)
     try:
-        codec = await load_engine(settings, engine)
+        await engine.start()
+        items, pending, store = await work_future
+        if not pending:
+            await engine.shutdown()
+            signal.alarm(0)
+            return "completed" if items else "empty"
+        codec_future = loop.run_in_executor(None, load_codec, settings)
         await asyncio.wait_for(
             engine.warmup(sorted(ALLOWED_VOICES)), timeout=settings.startup_timeout_seconds
         )
-        codec.warmup()
+        codec = await codec_future
     except asyncio.TimeoutError as exc:
         await engine.shutdown()
         raise StartupTimeout() from exc
@@ -124,6 +134,7 @@ async def body(settings, control, heartbeat, telemetry, deadline):
 
     signal.alarm(0)
     _PHASE.set("run")
+    heartbeat.set("generating", len(pending))
     remaining_budget = max(60, int(deadline - time.time()))
     signal.alarm(min(config.run_limit_seconds(settings, len(pending)), remaining_budget))
     pipeline = Pipeline(settings, engine, codec, store, control, telemetry, heartbeat)
