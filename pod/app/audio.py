@@ -9,28 +9,42 @@ import soxr
 
 _LOCAL = threading.local()
 _OGG_MAGIC = b"OggS"
+FFMPEG_TIMEOUT_SECONDS = 30
+SIZE_SLACK_BYTES = 2048
+
+
+class EncodeError(Exception):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
 
 
 def ffmpeg_binary():
     return os.environ.get("FFMPEG_BIN") or "ffmpeg"
 
 
+def peak_of(audio):
+    return float(max(audio.max(), -audio.min()))
+
+
 def trim_edges(audio, sample_rate, threshold, pad_seconds):
     if audio.size == 0:
         return audio
-    active = np.flatnonzero(np.abs(audio) > threshold)
-    if active.size == 0:
+    active = (audio > threshold) | (audio < -threshold)
+    if not active.any():
         return audio[:0]
+    first = int(active.argmax())
+    last = audio.size - 1 - int(active[::-1].argmax())
     pad = int(pad_seconds * sample_rate)
-    start = max(0, int(active[0]) - pad)
-    end = min(audio.size, int(active[-1]) + pad + 1)
+    start = max(0, first - pad)
+    end = min(audio.size, last + pad + 1)
     return audio[start:end]
 
 
 def peak_normalize(audio, target):
     if audio.size == 0:
         return audio
-    peak = float(np.max(np.abs(audio)))
+    peak = peak_of(audio)
     if peak <= 0.0:
         return audio
     return audio * (target / peak)
@@ -39,26 +53,29 @@ def peak_normalize(audio, target):
 def rms(audio):
     if audio.size == 0:
         return 0.0
-    return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
+    flat = audio.reshape(-1)
+    return float(np.sqrt(np.einsum("i,i->", flat, flat, dtype=np.float64) / flat.size))
 
 
-def loudness_normalize(audio, target_db, peak_target):
+def loudness_normalize(audio, target_db, peak_target, inplace=False):
     level = rms(audio)
     if level <= 1e-8:
         return audio
-    scaled = audio * ((10.0 ** (target_db / 20.0)) / level)
-    peak = float(np.max(np.abs(scaled)))
+    gain = (10.0 ** (target_db / 20.0)) / level
+    peak = peak_of(audio) * gain
     if peak > peak_target:
-        scaled = scaled * (peak_target / peak)
-    return scaled
+        gain *= peak_target / peak
+    if inplace:
+        audio *= gain
+        return audio
+    return audio * gain
 
 
-def fade_edges(audio, sample_rate, seconds):
-    """Short fade in/out so decoder padding or a hard trim never leaves a click."""
+def fade_edges(audio, sample_rate, seconds, inplace=False):
     n = min(int(seconds * sample_rate), audio.size // 2)
     if n <= 0:
         return audio
-    out = np.array(audio, dtype=np.float32, copy=True)
+    out = audio if inplace else np.array(audio, dtype=np.float32, copy=True)
     ramp = np.linspace(0.0, 1.0, n, endpoint=False, dtype=np.float32)
     out[:n] *= ramp
     out[-n:] *= ramp[::-1]
@@ -66,8 +83,6 @@ def fade_edges(audio, sample_rate, seconds):
 
 
 def check_shape(audio, sample_rate, settings, text_chars):
-    """Duration checks on the trimmed clip. Cheap, and catches loops, babble and cut-offs
-    before they are cached (and served) for a year."""
     duration = audio.size / float(sample_rate)
     if duration < settings.min_duration:
         return "too_short"
@@ -82,14 +97,9 @@ def check_shape(audio, sample_rate, settings, text_chars):
 
 
 def process(audio, settings, text_chars=None):
-    """Returns (float32 audio, None) or (None, reason).
-
-    Silence is judged on the raw level. Judging it after peak normalisation would let
-    noise-only output through, because normalising makes any signal look loud.
-    """
     if audio is None or audio.size == 0:
         return None, "empty"
-    if not np.isfinite(audio).all():
+    if not np.isfinite(np.sum(audio, dtype=np.float64)):
         return None, "non_finite"
     sr = settings.source_sample_rate
     trimmed = trim_edges(audio, sr, settings.trim_threshold, settings.trim_pad_seconds)
@@ -98,11 +108,13 @@ def process(audio, settings, text_chars=None):
     reason = check_shape(trimmed, sr, settings, text_chars)
     if reason is not None:
         return None, reason
-    out = peak_normalize(trimmed, settings.peak_target)
+    out = peak_normalize(trimmed, settings.peak_target).astype(np.float32, copy=False)
+    if np.may_share_memory(out, audio):
+        out = out.copy()
     if settings.loudness_normalize:
-        out = loudness_normalize(out, settings.loudness_target_db, settings.peak_target)
-    out = fade_edges(out, sr, settings.fade_seconds)
-    return out.astype(np.float32, copy=False), None
+        out = loudness_normalize(out, settings.loudness_target_db, settings.peak_target, inplace=True)
+    out = fade_edges(out, sr, settings.fade_seconds, inplace=True)
+    return out, None
 
 
 def encode_wav(audio, sample_rate):
@@ -143,20 +155,28 @@ class OpusEncoder:
             "ogg",
             "pipe:1",
         ]
-        result = subprocess.run(
-            command,
-            input=pcm.tobytes(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                command,
+                input=pcm.tobytes(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=FFMPEG_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise EncodeError("ffmpeg_timeout") from exc
+        except OSError as exc:
+            raise EncodeError("ffmpeg_unavailable") from exc
         if result.returncode != 0 or not result.stdout.startswith(_OGG_MAGIC):
-            raise RuntimeError("opus_encode_failed")
+            raise EncodeError("opus_encode_failed")
         return result.stdout
 
 
 def to_int16(audio):
-    return (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+    scaled = np.clip(audio, -1.0, 1.0)
+    scaled *= 32767.0
+    return scaled.astype(np.int16)
 
 
 def encode_ogg(audio, settings):
@@ -177,14 +197,28 @@ def encode_ogg(audio, settings):
     return encoder.encode(to_int16(resampled))
 
 
-def encode(audio, fmt, settings):
-    if fmt == "wav":
-        return encode_wav(audio, settings.source_sample_rate), "audio/wav", "wav"
-    return encode_ogg(audio, settings), "audio/ogg", "ogg"
-
-
 def bitrate_bps(value):
     text = str(value).strip().lower()
     if text.endswith("k"):
         return int(float(text[:-1]) * 1000)
     return int(text)
+
+
+def encoded_size_ok(size, seconds, settings):
+    expected = bitrate_bps(settings.opus_bitrate) / 8.0 * seconds
+    low = expected * settings.opus_size_low
+    high = expected * settings.opus_size_high + SIZE_SLACK_BYTES
+    return low <= size <= high
+
+
+def encode(audio, fmt, settings):
+    if fmt == "wav":
+        data = encode_wav(audio, settings.source_sample_rate)
+        if not data:
+            raise EncodeError("empty_encode")
+        return data, "audio/wav", "wav"
+    data = encode_ogg(audio, settings)
+    seconds = audio.size / float(settings.source_sample_rate)
+    if not encoded_size_ok(len(data), seconds, settings):
+        raise EncodeError("opus_size")
+    return data, "audio/ogg", "ogg"

@@ -12,7 +12,6 @@ HOP = 2048
 
 
 def clean_tokens(tokens):
-    """Keep audio tokens only (header/EOS tokens are dropped) and whole 7-token frames."""
     arr = np.asarray(tokens, dtype=np.int64)
     if arr.size == 0:
         return arr
@@ -22,12 +21,6 @@ def clean_tokens(tokens):
 
 
 def tokens_to_layers(tokens, tolerance=0.0):
-    """Split a token stream into the three SNAC layers.
-
-    A token from the wrong 4096-band means the model slipped. A stray one or two are repaired
-    (folded into range) instead of throwing away a whole clip that already cost GPU time. A
-    high share means the stream is misaligned, and the clip is rejected.
-    """
     arr = np.asarray(tokens, dtype=np.int64)
     if arr.size == 0 or arr.size % FRAME:
         return None
@@ -57,12 +50,16 @@ def expected_samples(frames):
 
 
 def pad_layer(dst, src, per_frame):
-    """Fill dst (one padded row) from src, repeating the last whole frame into the tail.
-    Zero padding would feed the decoder a code it never saw at that position."""
     dst[: src.size] = src
     missing = dst.size - src.size
-    if missing > 0 and src.size >= per_frame:
+    if missing <= 0:
+        return
+    if src.size >= per_frame:
         dst[src.size :] = np.tile(src[-per_frame:], missing // per_frame)
+        return
+    tail = src[-per_frame:] if src.size >= per_frame else src
+    reps = (missing + tail.size - 1) // tail.size
+    dst[src.size :] = np.tile(tail, reps)[:missing]
 
 
 def is_oom(exc):
@@ -82,7 +79,6 @@ class Codec:
         self.stream = torch.cuda.Stream(device=device) if device.startswith("cuda") else None
 
     def warmup(self):
-        """First call pays kernel/cuDNN setup. Do it before the clock starts on real work."""
         frames = 12
         tokens = AUDIO_OFFSET + (np.arange(frames * FRAME) % FRAME) * BAND
         layers = tokens_to_layers(tokens)
@@ -122,8 +118,6 @@ class Codec:
         return results
 
     def _decode_safe(self, group):
-        """Decode a group. On any failure split it in half and retry, so one bad clip or one
-        out-of-memory batch costs a smaller batch instead of the whole run."""
         try:
             return self._decode_group(group), []
         except Exception as exc:

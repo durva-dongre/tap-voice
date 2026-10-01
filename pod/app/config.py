@@ -44,7 +44,7 @@ class Settings:
     run_id: str
     run_token: str
     server_url: str
-    # --- engine ---
+    api_path_prefix: str
     max_num_seqs: int
     gpu_memory_utilization: float
     gpu_total_mb: int
@@ -60,7 +60,6 @@ class Settings:
     final_only_outputs: bool
     skip_detokenize: bool
     warmup_voices: int
-    # --- sampling ---
     logits_mask: str
     allow_header_tokens: bool
     temperature: float
@@ -70,7 +69,6 @@ class Settings:
     use_seeds: bool
     base_seed: int
     retry_growth: float
-    # --- codec / audio ---
     snac_half: bool
     bad_code_tolerance: float
     opus_bitrate: str
@@ -89,13 +87,11 @@ class Settings:
     min_sec_per_char: float
     max_sec_per_char: float
     pace_slack_seconds: float
-    # --- storage ---
     gcs_bucket: str
     gcs_prefix: str
     gcs_credentials_b64: str
     cdn_base_url: str
     model_revision: str
-    # --- limits / cost guards ---
     pod_limit_seconds: int
     seconds_per_item_cap: float
     startup_timeout_seconds: int
@@ -106,7 +102,6 @@ class Settings:
     breaker_fail_ratio: float
     max_spend_usd: float
     gpu_hourly_rate: float
-    # --- pipeline ---
     upload_threads: int
     decode_microbatch: int
     decode_flush_seconds: float
@@ -151,16 +146,15 @@ def load():
         run_id=run_id,
         run_token=run_token,
         server_url=server_url,
+        api_path_prefix=_str("API_PATH_PREFIX", "/internal/pod/"),
         max_num_seqs=_int("MAX_NUM_SEQS", 48),
         gpu_memory_utilization=_float("GPU_MEMORY_UTILIZATION", 0.90),
         gpu_total_mb=_int("GPU_TOTAL_MB", 24564),
         max_model_len=_int("MAX_MODEL_LEN", 2700),
-        # "auto" = model dtype. FP8 KV needs CUDA arch >= 8.9 and is guarded in engine.py.
         kv_cache_dtype=_str("KV_CACHE_DTYPE", "auto"),
         quantization=_str("QUANTIZATION", ""),
         model_dir=_str("MODEL_DIR", "/opt/models/svara-fp8"),
         snac_dir=_str("SNAC_DIR", "/opt/models/snac_24khz"),
-        # Prompts are unique, so prefix caching only adds a kernel path (the one that crashed on Ampere).
         enable_prefix_caching=_bool("ENABLE_PREFIX_CACHING", False),
         enable_chunked_prefill=_bool("ENABLE_CHUNKED_PREFILL", True),
         num_scheduler_steps=_int("NUM_SCHEDULER_STEPS", 1),
@@ -227,7 +221,6 @@ def load():
         max_max_tokens=_int("MAX_MAX_TOKENS", 2400),
         tokens_per_char=_float("TOKENS_PER_CHAR", 9.0),
         min_tokens_per_char=_float("MIN_TOKENS_PER_CHAR", 7.0),
-        # Margin added on top of items * SECONDS_PER_ITEM_CAP for the RUN alarm (startup is separate).
         startup_margin_seconds=_int("STARTUP_MARGIN_SECONDS", 120),
         opus_size_low=_float("OPUS_SIZE_LOW", 0.6),
         opus_size_high=_float("OPUS_SIZE_HIGH", 1.6),
@@ -253,7 +246,6 @@ def reset():
 
 
 def run_limit_seconds(settings, pending):
-    """Alarm for the generation phase only. Model loading has its own, tighter alarm."""
     dynamic = int(pending * settings.seconds_per_item_cap) + settings.startup_margin_seconds
     return max(180, min(settings.pod_limit_seconds, dynamic))
 

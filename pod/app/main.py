@@ -3,6 +3,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 
 from . import config, manifest as manifest_mod
@@ -17,7 +18,7 @@ from .voices import ALLOWED_VOICES
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("main")
 
-# Both are BaseException so no library's `except Exception` can swallow them.
+
 class Timeout(BaseException):
     pass
 
@@ -26,11 +27,25 @@ class StartupTimeout(BaseException):
     pass
 
 
-_PHASE = {"name": "startup"}
+class Phase:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._name = "startup"
+
+    def set(self, name):
+        with self._lock:
+            self._name = name
+
+    def get(self):
+        with self._lock:
+            return self._name
+
+
+_PHASE = Phase()
 
 
 def _alarm(*_):
-    if _PHASE["name"] == "startup":
+    if _PHASE.get() == "startup":
         raise StartupTimeout()
     raise Timeout()
 
@@ -53,7 +68,6 @@ def report_rejected(control, rejected):
 
 
 def report_existing(control, store, items, telemetry):
-    """Everything is already stored: tell the server and finish without touching the GPU."""
     records = [
         {
             "id": item.id,
@@ -70,8 +84,6 @@ def report_existing(control, store, items, telemetry):
 
 
 async def load_engine(settings, engine):
-    # engine.start() blocks the event loop while the model loads, so asyncio cannot time it
-    # out. The SIGALRM set in body() is the real guard.
     await engine.start()
     return Codec(
         settings.snac_dir, half=settings.snac_half, tolerance=settings.bad_code_tolerance
@@ -96,7 +108,7 @@ async def body(settings, control, heartbeat, telemetry, deadline):
         return "completed"
 
     heartbeat.set("loading_engine", len(pending))
-    _PHASE["name"] = "startup"
+    _PHASE.set("startup")
     signal.alarm(settings.startup_timeout_seconds + settings.startup_alarm_margin_seconds)
     engine = Engine(settings)
     try:
@@ -110,7 +122,8 @@ async def body(settings, control, heartbeat, telemetry, deadline):
         raise StartupTimeout() from exc
     telemetry.mark_ready()
 
-    _PHASE["name"] = "run"
+    signal.alarm(0)
+    _PHASE.set("run")
     remaining_budget = max(60, int(deadline - time.time()))
     signal.alarm(min(config.run_limit_seconds(settings, len(pending)), remaining_budget))
     pipeline = Pipeline(settings, engine, codec, store, control, telemetry, heartbeat)
@@ -136,8 +149,6 @@ def map_reason(exc):
 
 
 def main():
-    """Runs one batch. Always reports completion and asks RunPod to delete the pod.
-    Returns a process exit code."""
     started = time.time()
     reason = "completed"
     settings = None
@@ -180,5 +191,4 @@ if __name__ == "__main__":
     code = main()
     sys.stdout.flush()
     sys.stderr.flush()
-    # vLLM background threads can keep the interpreter alive after the work is done.
     os._exit(code)

@@ -10,6 +10,9 @@ log = logging.getLogger("control")
 
 stop_event = threading.Event()
 
+PROGRESS_CHUNK = 200
+DEFAULT_PREFIX = "/internal/pod/"
+
 
 class Stop(Exception):
     pass
@@ -17,6 +20,19 @@ class Stop(Exception):
 
 class ClientError(Exception):
     pass
+
+
+def unwrap(payload):
+    if isinstance(payload, dict) and isinstance(payload.get("message"), dict):
+        return payload["message"]
+    return payload
+
+
+def build_url(settings, endpoint):
+    prefix = getattr(settings, "api_path_prefix", "") or DEFAULT_PREFIX
+    if not prefix.startswith("/"):
+        prefix = "/" + prefix
+    return settings.server_url + prefix + endpoint
 
 
 class Control:
@@ -27,12 +43,15 @@ class Control:
             {"X-Run-Id": settings.run_id, "X-Run-Token": settings.run_token}
         )
 
-    def _request(self, method, path, retries=4, timeout=30, backoff_cap=8, **kwargs):
+    def url(self, endpoint):
+        return build_url(self.settings, endpoint)
+
+    def _request(self, method, endpoint, retries=4, timeout=30, backoff_cap=8, **kwargs):
         error = None
         for attempt in range(retries):
             try:
                 response = self.session.request(
-                    method, self.settings.server_url + path, timeout=timeout, **kwargs
+                    method, self.url(endpoint), timeout=timeout, **kwargs
                 )
             except requests.RequestException as exc:
                 error = exc
@@ -43,30 +62,37 @@ class Control:
                 if code < 400:
                     if not response.content:
                         return {}
-                    return response.json()
-                if code < 500 and code != 429:
+                    try:
+                        return unwrap(response.json())
+                    except ValueError:
+                        error = RuntimeError("bad_json")
+                elif code < 500 and code != 429:
                     raise ClientError(f"http_{code}")
-                error = RuntimeError(f"http_{code}")
+                else:
+                    error = RuntimeError(f"http_{code}")
             if attempt < retries - 1:
                 time.sleep(min(2 ** attempt, backoff_cap))
         raise error
 
     def manifest(self):
-        return self._request("GET", "/internal/pod/manifest", timeout=60)
+        return self._request("POST", "manifest", json={}, timeout=60)
 
     def progress(self, records):
-        return self._request(
-            "POST",
-            "/internal/pod/progress",
-            json={"records": records},
-            retries=5,
-            timeout=45,
-        )
+        result = {}
+        for start in range(0, len(records), PROGRESS_CHUNK):
+            result = self._request(
+                "POST",
+                "progress",
+                json={"records": records[start : start + PROGRESS_CHUNK]},
+                retries=5,
+                timeout=45,
+            )
+        return result
 
     def complete(self, reason, gpu_seconds, stats):
         return self._request(
             "POST",
-            "/internal/pod/complete",
+            "complete",
             json={"reason": reason, "gpu_seconds": gpu_seconds, "stats": stats},
             retries=3,
             timeout=20,
@@ -76,12 +102,12 @@ class Control:
     def beat(self, phase, remaining):
         response = self._request(
             "POST",
-            "/internal/pod/beat",
+            "beat",
             json={"phase": phase, "remaining": remaining},
             retries=1,
             timeout=10,
         )
-        if response.get("stop"):
+        if isinstance(response, dict) and response.get("stop"):
             stop_event.set()
         return response
 
@@ -115,12 +141,6 @@ def _say(message):
 
 
 def terminate_self(attempts=3):
-    """Delete this pod through the RunPod API so billing stops.
-
-    Returns True once RunPod accepted the request (or says the pod is already gone).
-    Every outcome is written to stderr so a permission problem is visible in the pod logs.
-    Falls back to stopping the pod if deleting keeps failing.
-    """
     pod_id = os.environ.get("RUNPOD_POD_ID", "").strip()
     api_key = os.environ.get("RUNPOD_API_KEY", "").strip()
     if not pod_id or not api_key:
